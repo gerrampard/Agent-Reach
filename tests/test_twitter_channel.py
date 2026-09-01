@@ -1,108 +1,171 @@
 # -*- coding: utf-8 -*-
+"""Twitter health checks must never trigger upstream browser-cookie fallback."""
 
-from unittest.mock import patch, Mock
+import os
+from unittest.mock import Mock, patch
 
-from agent_reach.channels.twitter import TwitterChannel
-
-
-def _cp(stdout="", stderr="", returncode=0):
-    m = Mock()
-    m.stdout = stdout
-    m.stderr = stderr
-    m.returncode = returncode
-    return m
+from agent_reach.backends import OpenCLIStatus
+from agent_reach.channels.twitter import (
+    TwitterChannel,
+    twitter_cli_child_env,
+)
 
 
-# --- twitter-cli tests ---
+def _which(*present):
+    return lambda name: f"/usr/local/bin/{name}" if name in present else None
 
-def test_check_twitter_cli_found_and_auth_ok():
-    """twitter-cli found + twitter status ok → ok."""
+
+def test_twitter_cli_without_explicit_auth_is_unverified():
     channel = TwitterChannel()
-    with patch("shutil.which", side_effect=lambda name: "/usr/local/bin/twitter" if name == "twitter" else None), patch(
+    with patch("shutil.which", side_effect=_which("twitter")), patch(
         "subprocess.run",
-        return_value=_cp(stdout="ok: true\nusername: testuser\n", returncode=0),
+        side_effect=AssertionError("twitter status must not run"),
     ):
         status, message = channel.check()
-    assert status == "ok"
-    assert "twitter-cli" in message
-    assert "完整可用" in message
 
-
-def test_check_twitter_cli_found_auth_missing():
-    """twitter-cli found + not_authenticated → warn about auth."""
-    channel = TwitterChannel()
-    with patch("shutil.which", side_effect=lambda name: "/usr/local/bin/twitter" if name == "twitter" else None), patch(
-        "subprocess.run",
-        return_value=_cp(
-            stderr="ok: false\nerror:\n  code: not_authenticated\n",
-            returncode=1,
-        ),
-    ):
-        status, message = channel.check()
     assert status == "warn"
-    assert "未认证" in message
+    assert "Cookie-Editor" in message
+    assert channel.active_backend is None
 
 
-# --- bird CLI fallback tests ---
+def test_saved_credentials_are_recognised_without_starting_upstream(
+    monkeypatch,
+):
+    config = Mock()
+    config.get.side_effect = lambda key: {
+        "twitter_auth_token": "saved-auth-token",
+        "twitter_ct0": "saved-ct0",
+    }.get(key)
+    monkeypatch.delenv("TWITTER_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("TWITTER_CT0", raising=False)
 
-def test_check_bird_fallback_auth_ok():
-    """No twitter-cli, but bird found + bird check ok → ok."""
-    channel = TwitterChannel()
-    def which_side_effect(name):
-        if name == "bird":
-            return "/usr/local/bin/bird"
-        return None
-    with patch("shutil.which", side_effect=which_side_effect), patch(
-        "subprocess.run",
-        return_value=_cp(stdout="Authenticated as @user\n", returncode=0),
-    ):
-        status, message = channel.check()
-    assert status == "ok"
-    assert "bird" in message
+    with patch("shutil.which", side_effect=_which("twitter")), patch(
+        "subprocess.run"
+    ) as run:
+        channel = TwitterChannel()
+        status, message = channel.check(config)
 
-
-def test_check_bird_fallback_auth_missing():
-    """No twitter-cli, bird found but Missing credentials → warn."""
-    channel = TwitterChannel()
-    def which_side_effect(name):
-        if name == "bird":
-            return "/usr/local/bin/bird"
-        return None
-    with patch("shutil.which", side_effect=which_side_effect), patch(
-        "subprocess.run",
-        return_value=_cp(stderr="Missing credentials\n", returncode=1),
-    ):
-        status, message = channel.check()
     assert status == "warn"
-    assert "未配置认证" in message
+    assert "已配置" in message
+    assert "不会执行" in message
+    assert channel.active_backend is None
+    run.assert_not_called()
+    assert "TWITTER_AUTH_TOKEN" not in os.environ
+    assert "TWITTER_CT0" not in os.environ
 
 
-# --- neither installed ---
+def test_child_env_keeps_existing_shell_credentials_authoritative(
+    monkeypatch,
+):
+    config = Mock()
+    config.get.side_effect = lambda key: {
+        "twitter_auth_token": "saved-auth-token",
+        "twitter_ct0": "saved-ct0",
+    }.get(key)
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "shell-auth-token")
+    monkeypatch.setenv("TWITTER_CT0", "shell-ct0")
 
-def test_check_nothing_installed():
-    """Neither twitter-cli nor bird → warn with install hint."""
+    assert twitter_cli_child_env(config) == {}
+    assert os.environ["TWITTER_AUTH_TOKEN"] == "shell-auth-token"
+    assert os.environ["TWITTER_CT0"] == "shell-ct0"
+
+
+def test_child_env_supplies_only_missing_saved_credentials(monkeypatch):
+    config = Mock()
+    config.get.side_effect = lambda key: {
+        "twitter_auth_token": "saved-auth-token",
+        "twitter_ct0": "saved-ct0",
+    }.get(key)
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "shell-auth-token")
+    monkeypatch.delenv("TWITTER_CT0", raising=False)
+
+    assert twitter_cli_child_env(config) == {"TWITTER_CT0": "saved-ct0"}
+
+
+def test_bird_with_explicit_env_remains_unverified(monkeypatch):
+    monkeypatch.setenv("AUTH_TOKEN", "explicit-auth")
+    monkeypatch.setenv("CT0", "explicit-ct0")
+    with patch("shutil.which", side_effect=_which("bird")), patch(
+        "subprocess.run",
+        side_effect=AssertionError("bird check must not run"),
+    ):
+        channel = TwitterChannel()
+        status, message = channel.check()
+
+    assert status == "warn"
+    assert "未实时验证" in message
+    assert channel.active_backend is None
+
+
+def test_bird_without_explicit_env_is_warn(monkeypatch):
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CT0", raising=False)
+    with patch("shutil.which", side_effect=_which("bird")):
+        channel = TwitterChannel()
+        status, message = channel.check()
+
+    assert status == "warn"
+    assert "未检测到显式" in message
+    assert channel.active_backend is None
+
+
+def test_nothing_installed_returns_install_hint():
     channel = TwitterChannel()
     with patch("shutil.which", return_value=None):
         status, message = channel.check()
+
     assert status == "warn"
     assert "twitter-cli" in message
+    assert channel.active_backend is None
 
 
-# --- twitter-cli preferred over bird ---
-
-def test_twitter_cli_preferred_over_bird():
-    """When both are installed, twitter-cli is used."""
-    channel = TwitterChannel()
-    def which_side_effect(name):
-        if name == "twitter":
-            return "/usr/local/bin/twitter"
-        if name == "bird":
-            return "/usr/local/bin/bird"
-        return None
-    with patch("shutil.which", side_effect=which_side_effect), patch(
-        "subprocess.run",
-        return_value=_cp(stdout="ok: true\n", returncode=0),
+def test_opencli_bridge_ready_is_unverified_for_twitter():
+    with patch(
+        "agent_reach.backends.opencli_status",
+        return_value=OpenCLIStatus(
+            installed=True,
+            extension_connected=True,
+            version="1.8.6",
+        ),
     ):
+        status, message = TwitterChannel()._check_opencli()
+
+    assert status == "warn"
+    assert "桥接已连接" in message
+    assert "登录态和实际命令未实时验证" in message
+
+
+def test_verified_backend_result_wins_over_unverified_twitter_cli():
+    channel = TwitterChannel()
+    with patch.object(
+        TwitterChannel,
+        "_check_twitter_cli",
+        return_value=("warn", "twitter-cli 未验证"),
+    ), patch.object(
+        TwitterChannel,
+        "_check_opencli",
+        return_value=("ok", "OpenCLI 可用"),
+    ), patch.object(TwitterChannel, "_check_bird", return_value=None):
         status, message = channel.check()
+
     assert status == "ok"
-    assert "twitter-cli" in message
+    assert message == "OpenCLI 可用"
+    assert channel.active_backend == "OpenCLI"
+
+
+def test_all_warn_returns_first_warning_without_active_backend():
+    channel = TwitterChannel()
+    with patch.object(
+        TwitterChannel,
+        "_check_twitter_cli",
+        return_value=("warn", "twitter-cli 未验证"),
+    ), patch.object(
+        TwitterChannel,
+        "_check_opencli",
+        return_value=("warn", "扩展未连接"),
+    ), patch.object(TwitterChannel, "_check_bird", return_value=None):
+        status, message = channel.check()
+
+    assert status == "warn"
+    assert message == "twitter-cli 未验证"
+    assert channel.active_backend is None

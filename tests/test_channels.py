@@ -6,7 +6,13 @@ import shutil
 import subprocess
 from urllib.error import URLError
 
+import pytest
+
+from agent_reach.backends import OpenCLIStatus
 from agent_reach.channels import get_all_channels, get_channel
+from agent_reach.channels.bilibili import BilibiliChannel
+from agent_reach.channels.facebook import FacebookChannel
+from agent_reach.channels.instagram import InstagramChannel
 from agent_reach.channels.v2ex import V2EXChannel
 from agent_reach.channels.xiaohongshu import XiaoHongShuChannel
 from agent_reach.channels.xueqiu import XueqiuChannel
@@ -27,7 +33,78 @@ class TestChannelRegistry:
         assert "web" in names
         assert "github" in names
         assert "twitter" in names
+        assert "facebook" in names
+        assert "instagram" in names
         assert "v2ex" in names
+
+
+class TestOpenCLISiteChannels:
+    def test_facebook_can_handle_common_urls(self):
+        ch = FacebookChannel()
+        assert ch.can_handle("https://www.facebook.com/zuck")
+        assert ch.can_handle("https://m.facebook.com/groups/123")
+        assert ch.can_handle("https://fb.com/some-page")
+        assert ch.can_handle("https://fb.watch/abc123")
+        assert not ch.can_handle("https://instagram.com/openai")
+
+    def test_instagram_can_handle_common_urls(self):
+        ch = InstagramChannel()
+        assert ch.can_handle("https://www.instagram.com/openai/")
+        assert ch.can_handle("https://instagram.com/p/abc123/")
+        assert ch.can_handle("https://instagr.am/p/abc123/")
+        assert not ch.can_handle("https://facebook.com/openai")
+
+    def test_opencli_bridge_ready_is_unverified_for_login_platform(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent_reach.backends.opencli_status",
+            lambda: OpenCLIStatus(
+                installed=True,
+                extension_connected=True,
+                version="1.8.3",
+            ),
+        )
+        ch = FacebookChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert ch.active_backend is None
+        assert "桥接已连接" in msg
+        assert "登录态和实际命令未实时验证" in msg
+        assert "facebook.com" in msg
+
+        instagram = InstagramChannel()
+        status, msg = instagram.check()
+        assert status == "warn"
+        assert instagram.active_backend is None
+        assert "桥接已连接" in msg
+        assert "instagram.com" in msg
+
+    def test_opencli_missing_reports_off(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent_reach.backends.opencli_status",
+            lambda: OpenCLIStatus(installed=False),
+        )
+        ch = InstagramChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+        assert "agent-reach install --system --channels opencli" in msg
+        assert "instagram.com" in msg
+
+    def test_opencli_installed_without_extension_reports_warn(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent_reach.backends.opencli_status",
+            lambda: OpenCLIStatus(
+                installed=True,
+                hint="OpenCLI 已安装，但 Chrome 扩展未安装。",
+            ),
+        )
+        ch = InstagramChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert ch.active_backend is None
+        assert "Chrome 扩展" in msg
 
 
 class TestV2EXChannel:
@@ -50,7 +127,7 @@ class TestV2EXChannel:
             def __exit__(self, *args):
                 pass
 
-            def read(self):
+            def read(self, _size=-1):
                 return b"[]"
 
         monkeypatch.setattr(
@@ -72,6 +149,46 @@ class TestV2EXChannel:
         status, msg = V2EXChannel().check()
         assert status == "warn"
         assert "失败" in msg
+
+    def test_check_passes_its_read_only_config_to_cookie_loading(self, monkeypatch):
+        """Doctor's config object must flow through instead of reopening config."""
+        import agent_reach.channels.xueqiu as xueqiu_mod
+
+        supplied_config = object()
+        observed = []
+        monkeypatch.setattr(xueqiu_mod, "_cookies_initialized", False)
+
+        def fake_load(config=None):
+            observed.append(config)
+            return False
+
+        fake_response_data = {
+            "data": {"quote": {"symbol": "SH601138", "current": 52.0}}
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def read(self):
+                return json.dumps(fake_response_data).encode()
+
+        monkeypatch.setattr(
+            xueqiu_mod, "_load_cookies_from_config", fake_load
+        )
+        monkeypatch.setattr(
+            xueqiu_mod._opener,
+            "open",
+            lambda req, timeout=None: FakeResponse(),
+        )
+
+        status, _ = XueqiuChannel().check(supplied_config)
+
+        assert status == "ok"
+        assert observed == [supplied_config]
 
     # ------------------------------------------------------------------ #
     # get_hot_topics
@@ -110,7 +227,7 @@ class TestV2EXChannel:
             def __exit__(self, *_):
                 pass
 
-            def read(self):
+            def read(self, _size=-1):
                 return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
@@ -135,7 +252,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_hot_topics(limit=3)
@@ -153,7 +270,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_hot_topics(limit=1)
@@ -181,7 +298,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_node_topics("python")
@@ -229,7 +346,7 @@ class TestV2EXChannel:
 
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(self._payload).encode()
+            def read(self, _size=-1): return json.dumps(self._payload).encode()
 
         def fake_urlopen(req, timeout=None):
             url = req.full_url
@@ -268,7 +385,7 @@ class TestV2EXChannel:
             def __init__(self, payload): self._payload = payload
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(self._payload).encode()
+            def read(self, _size=-1): return json.dumps(self._payload).encode()
 
         def fake_urlopen(req, timeout=None):
             if "replies" in req.full_url:
@@ -304,7 +421,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_user).encode()
+            def read(self, _size=-1): return json.dumps(fake_user).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         user = V2EXChannel().get_user("alice")
@@ -342,9 +459,12 @@ class TestXueqiuChannel:
 
         fake_response_data = {
             "data": {
-                "items": [
-                    {"quote": {"symbol": "SH000001", "name": "上证指数", "current": 3200.0}}
-                ]
+                "quote": {
+                    "symbol": "SH601138",
+                    "name": "工业富联",
+                    "current": 52.0,
+                    "pe_ttm": 38.1,
+                }
             }
         }
 
@@ -387,27 +507,26 @@ class TestXueqiuChannel:
 
         fake_data = {
             "data": {
-                "items": [
-                    {
-                        "quote": {
-                            "symbol": "SH600519",
-                            "name": "贵州茅台",
-                            "current": 1800.0,
-                            "percent": 1.5,
-                            "chg": 26.6,
-                            "high": 1810.0,
-                            "low": 1770.0,
-                            "open": 1775.0,
-                            "last_close": 1773.4,
-                            "volume": 12345678,
-                            "amount": 22000000000,
-                            "market_capital": 2260000000000,
-                            "turnover_rate": 0.098,
-                            "pe_ttm": 30.5,
-                            "timestamp": 1700000000000,
-                        }
-                    }
-                ]
+                "quote": {
+                    "symbol": "SH600519",
+                    "name": "贵州茅台",
+                    "current": 1800.0,
+                    "percent": 1.5,
+                    "chg": 26.6,
+                    "high": 1810.0,
+                    "low": 1770.0,
+                    "open": 1775.0,
+                    "last_close": 1773.4,
+                    "volume": 12345678,
+                    "amount": 22000000000,
+                    "market_capital": 2260000000000,
+                    "turnover_rate": 0.098,
+                    "pe_ttm": 30.5,
+                    "pe_forecast": 25.2,
+                    "pb": 8.5,
+                    "eps": 59.0,
+                    "timestamp": 1700000000000,
+                }
             }
         }
 
@@ -604,9 +723,13 @@ class TestXueqiuChannel:
         monkeypatch.setattr(
             xq_mod,
             "_load_cookies_from_config",
-            lambda: (xq_mod._inject_cookie_string("xq_a_token=TESTTOKEN; xq_is_login=1") or True),
+            lambda config=None: (
+                xq_mod._inject_cookie_string(
+                    "xq_a_token=TESTTOKEN; xq_is_login=1"
+                )
+                or True
+            ),
         )
-        monkeypatch.setattr(xq_mod, "_load_cookies_from_browser", lambda: False)
 
         # Patch opener so no real HTTP call is made
         class FakeResp:
@@ -620,6 +743,30 @@ class TestXueqiuChannel:
         assert xq_mod._cookies_initialized is True
         cookie_names = {c.name for c in xq_mod._cookie_jar}
         assert "xq_a_token" in cookie_names
+
+    def test_ensure_cookies_uses_public_homepage_fallback(self, monkeypatch):
+        import agent_reach.channels.xueqiu as xueqiu_mod
+
+        monkeypatch.setattr(xueqiu_mod, "_cookies_initialized", False)
+        monkeypatch.setattr(
+            xueqiu_mod,
+            "_load_cookies_from_config",
+            lambda config=None: False,
+        )
+        requested = []
+
+        class FakeResponse:
+            pass
+
+        monkeypatch.setattr(
+            xueqiu_mod._opener,
+            "open",
+            lambda req, timeout=None: requested.append(req.full_url) or FakeResponse(),
+        )
+        xueqiu_mod._ensure_cookies()
+
+        assert requested == ["https://xueqiu.com"]
+        assert xueqiu_mod._cookies_initialized is True
 
     def test_get_json_sends_referer_and_browser_ua(self, monkeypatch):
         """_get_json() must send Referer and a browser-like User-Agent."""
@@ -647,61 +794,76 @@ class TestXueqiuChannel:
 
 
 class TestRedditChannel:
-    def test_reports_off_when_not_installed(self, monkeypatch):
+    """多后端：OpenCLI > rdt-cli，没有零配置路径。"""
+
+    @staticmethod
+    def _isolate(monkeypatch, opencli=None):
+        """隔离 OpenCLI 候选（None = 未安装），聚焦 rdt-cli 路径。"""
+        from agent_reach.channels.reddit import RedditChannel
+        monkeypatch.setattr(RedditChannel, "_check_opencli", lambda self: opencli)
+
+    def test_reports_off_when_nothing_installed(self, monkeypatch):
+        self._isolate(monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _: None)
         from agent_reach.channels.reddit import RedditChannel
         status, msg = RedditChannel().check()
         assert status == "off"
-        assert "rdt-cli" in msg
-        assert "public-clis/rdt-cli" in msg
+        # 诚实口径：明说没有零配置路径，推荐 OpenCLI + rdt git 源
+        assert "零配置" in msg
+        assert "opencli" in msg
+        assert "git+https://github.com/public-clis/rdt-cli.git" in msg
 
-    def test_reports_ok_when_authenticated(self, monkeypatch):
-        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/rdt")
-        fake_output = json.dumps({
-            "ok": True,
-            "schema_version": "1",
-            "data": {"authenticated": True, "username": "testuser", "cookie_count": 1},
-        })
-
-        def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 0, fake_output, "")
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+    def test_opencli_ready_wins(self, monkeypatch):
+        self._isolate(monkeypatch, opencli=("ok", "OpenCLI 可用（复用浏览器登录态）"))
+        monkeypatch.setattr(shutil, "which", lambda _: None)
         from agent_reach.channels.reddit import RedditChannel
-        status, msg = RedditChannel().check()
+        ch = RedditChannel()
+        status, msg = ch.check()
         assert status == "ok"
-        assert "testuser" in msg
+        assert ch.active_backend == "OpenCLI"
 
-    def test_reports_warn_when_not_authenticated(self, monkeypatch):
+    def test_saved_rdt_cookie_is_unverified_not_active(
+        self, monkeypatch, isolated_home
+    ):
+        self._isolate(monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/rdt")
-        fake_output = json.dumps({
-            "ok": True,
-            "schema_version": "1",
-            "data": {"authenticated": False, "username": None, "cookie_count": 0},
-        })
-
-        def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 0, fake_output, "")
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        credential_path = (
+            isolated_home / ".config" / "rdt-cli" / "credential.json"
+        )
+        credential_path.parent.mkdir(parents=True)
+        credential_path.write_text(
+            json.dumps(
+                {
+                    "cookies": {"reddit_session": "explicit"},
+                    "saved_at": __import__("time").time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute rdt status"
+            ),
+        )
         from agent_reach.channels.reddit import RedditChannel
-        status, msg = RedditChannel().check()
+        ch = RedditChannel()
+        status, msg = ch.check()
         assert status == "warn"
-        assert "403" in msg
-        assert "rdt login" in msg
+        assert "未实时验证" in msg
+        assert ch.active_backend is None
+
+    def test_reports_warn_when_cookie_is_missing(self, monkeypatch):
+        self._isolate(monkeypatch)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/rdt")
+        from agent_reach.channels.reddit import RedditChannel
+        ch = RedditChannel()
+        status, msg = ch.check()
+        assert status == "warn"
         assert "Cookie-Editor" in msg
         assert "chromewebstore.google.com" in msg
-
-    def test_reports_warn_when_status_check_fails(self, monkeypatch):
-        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/rdt")
-
-        def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 1, "not valid json{{{", "")
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
-        from agent_reach.channels.reddit import RedditChannel
-        status, msg = RedditChannel().check()
-        assert status == "warn"
+        assert ch.active_backend is None
 
     def test_can_handle_reddit_urls(self):
         from agent_reach.channels.reddit import RedditChannel
@@ -713,19 +875,89 @@ class TestRedditChannel:
 
 
 class TestXiaoHongShuChannel:
-    def test_reports_ok_when_cli_authenticated(self, monkeypatch):
+    """多后端选择逻辑：OpenCLI > xiaohongshu-mcp > xhs-cli，第一个完整可用者获胜。"""
+
+    @staticmethod
+    def _isolate(monkeypatch, opencli=None, mcp_reachable=False):
+        """隔离 OpenCLI / mcp 候选，让测试聚焦目标后端。
+
+        opencli: None 表示未安装；否则传入 (status, message) 二元组。
+        """
+        import agent_reach.channels.xiaohongshu as xhs_mod
+
+        monkeypatch.setattr(
+            XiaoHongShuChannel, "_check_opencli", lambda self: opencli
+        )
+        monkeypatch.setattr(
+            xhs_mod, "_mcp_service_reachable", lambda timeout=3: mcp_reachable
+        )
+
+    def test_opencli_bridge_ready_is_unverified(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent_reach.backends.opencli_status",
+            lambda: OpenCLIStatus(
+                installed=True,
+                extension_connected=True,
+                version="1.8.6",
+            ),
+        )
+
+        status, message = XiaoHongShuChannel()._check_opencli()
+
+        assert status == "warn"
+        assert "桥接已连接" in message
+        assert "登录态和实际命令未实时验证" in message
+
+    def test_saved_cli_cookie_is_unverified_not_active(
+        self, monkeypatch, isolated_home
+    ):
+        self._isolate(monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+        cookie_path = isolated_home / ".xiaohongshu-cli" / "cookies.json"
+        cookie_path.parent.mkdir()
+        cookie_path.write_text(
+            json.dumps(
+                {"a1": "explicit", "saved_at": __import__("time").time()}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute xhs status"
+            ),
+        )
 
-        def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 0, "ok: true\nusername: testuser\n", "")
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "未实时验证" in msg
+        assert ch.active_backend is None
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+    def test_saved_cli_cookie_refuses_ancestor_symlink(
+        self, monkeypatch, isolated_home
+    ):
+        self._isolate(monkeypatch)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+        victim_dir = isolated_home / "victim-xhs"
+        victim_dir.mkdir()
+        (victim_dir / "cookies.json").write_text(
+            json.dumps({"a1": "do-not-read"}),
+            encoding="utf-8",
+        )
+        (isolated_home / ".xiaohongshu-cli").symlink_to(
+            victim_dir,
+            target_is_directory=True,
+        )
 
-        status, msg = XiaoHongShuChannel().check()
-        assert status == "ok"
-        assert "完整可用" in msg
+        status, message = XiaoHongShuChannel()._check_xhs_cli()
+
+        assert status == "warn"
+        assert "符号链接" in message
 
     def test_reports_warn_when_not_authenticated(self, monkeypatch):
+        self._isolate(monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
 
         def fake_run(cmd, **kwargs):
@@ -733,12 +965,858 @@ class TestXiaoHongShuChannel:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        status, msg = XiaoHongShuChannel().check()
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
         assert status == "warn"
-        assert "xhs login" in msg
+        assert "Cookie-Editor" in msg
+        assert "configure xhs-cookies" in msg
+        assert ch.active_backend is None
 
-    def test_reports_off_when_not_installed(self, monkeypatch):
+    def test_reports_off_when_nothing_installed(self, monkeypatch):
+        self._isolate(monkeypatch)
         monkeypatch.setattr(shutil, "which", lambda _: None)
-        status, msg = XiaoHongShuChannel().check()
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
         assert status == "off"
-        assert "xiaohongshu-cli" in msg
+        # off 指引推荐当代后端，而非停更的 xhs-cli
+        assert "opencli" in msg
+        assert "xiaohongshu-mcp" in msg
+        assert ch.active_backend is None
+
+    def test_opencli_ready_wins_over_cli(self, monkeypatch):
+        """OpenCLI 完整可用时按序获胜，即使 xhs-cli 也完整可用。"""
+        self._isolate(monkeypatch, opencli=("ok", "OpenCLI 可用（复用浏览器登录态）"))
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "ok: true\n", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert ch.active_backend == "OpenCLI"
+
+    def test_opencli_warn_remains_first_when_cli_is_only_unverified(
+        self, monkeypatch
+    ):
+        self._isolate(monkeypatch, opencli=("warn", "扩展未连接"))
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "ok: true\n", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert msg == "扩展未连接"
+        assert ch.active_backend is None
+
+    def test_mcp_service_wins_when_opencli_absent(
+        self, monkeypatch, tmp_path
+    ):
+        """服务器场景：OpenCLI 未装、mcp 服务可达且 mcporter 已接入 → mcp 获胜。"""
+        self._isolate(monkeypatch, mcp_reachable=True)
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"xiaohongshu": {"baseUrl": "http://local"}},
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_which(name):
+            return "/usr/local/bin/mcporter" if name == "mcporter" else None
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert ch.active_backend is None
+        assert "未验证登录态" in msg
+
+    def test_mcp_reachable_but_mcporter_unconfigured_warns(
+        self, monkeypatch, tmp_path
+    ):
+        self._isolate(monkeypatch, mcp_reachable=True)
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"exa": {"baseUrl": "https://example.test"}},
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_which(name):
+            return "/usr/local/bin/mcporter" if name == "mcporter" else None
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+
+        ch = XiaoHongShuChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "mcporter config add xiaohongshu" in msg
+        assert ch.active_backend is None
+
+    def test_mcp_metadata_containing_xiaohongshu_is_not_configured(
+        self, monkeypatch, tmp_path
+    ):
+        """Paths and URLs are not valid server-name health signals."""
+        self._isolate(monkeypatch, mcp_reachable=True)
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "unrelated": {
+                            "baseUrl": "http://xiaohongshu-project.test/mcp"
+                        }
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: "/usr/local/bin/mcporter"
+            if name == "mcporter"
+            else None,
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+
+        ch = XiaoHongShuChannel()
+        status, message = ch.check()
+
+        assert status == "warn"
+        assert "未接入" in message
+        assert ch.active_backend is None
+
+    def test_all_xhs_auth_hints_exclude_qr_and_automatic_cookie_read(
+        self, monkeypatch
+    ):
+        """XHS remediation must remain on the explicit Cookie-Editor path."""
+        self._isolate(monkeypatch)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 1, "", "not_authenticated"
+            ),
+        )
+
+        status, message = XiaoHongShuChannel().check()
+
+        assert status == "warn"
+        assert "Cookie-Editor" in message
+        assert "configure xhs-cookies" in message
+        assert "扫码" not in message
+        assert "自动从浏览器" not in message
+
+    def test_unverified_cli_override_cannot_hide_working_opencli(
+        self, monkeypatch
+    ):
+        self._isolate(monkeypatch, opencli=("ok", "OpenCLI 可用"))
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/xhs")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "ok: true\n", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        class _Cfg:
+            def get(self, key, default=None):
+                return "xhs-cli" if key == "xiaohongshu_backend" else default
+
+        ch = XiaoHongShuChannel()
+        status, _ = ch.check(_Cfg())
+        assert status == "ok"
+        assert ch.active_backend == "OpenCLI"
+
+
+class TestBilibiliChannel:
+    """多后端：bili-cli > OpenCLI > 搜索 API。yt-dlp 已退出 B站（412 实锤）。"""
+
+    @staticmethod
+    def _isolate(monkeypatch, opencli=None, api_ok=False):
+        import agent_reach.channels.bilibili as bilibili_mod
+        monkeypatch.setattr(
+            bilibili_mod.BilibiliChannel, "_check_opencli", lambda self: opencli
+        )
+        monkeypatch.setattr(bilibili_mod, "_search_api_ok", lambda: api_ok)
+
+    def test_bili_cli_ok_is_active_backend(self, monkeypatch):
+        self._isolate(monkeypatch)
+        monkeypatch.setattr(
+            shutil, "which",
+            lambda cmd: "/usr/local/bin/bili" if cmd == "bili" else None,
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "bili, version 0.6.2", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert "bili-cli 可用" in msg
+        assert ch.active_backend == "bili-cli"
+
+    def test_opencli_bridge_ready_is_unverified(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent_reach.backends.opencli_status",
+            lambda: OpenCLIStatus(
+                installed=True,
+                extension_connected=True,
+                version="1.8.6",
+            ),
+        )
+
+        status, message = BilibiliChannel()._check_opencli()
+
+        assert status == "warn"
+        assert "桥接已连接" in message
+        assert "实际命令未实时验证" in message
+
+    def test_bili_broken_falls_back_to_api_with_hint_kept(self, monkeypatch):
+        """bili 断链 → API 兜底获胜，但重装处方必须保留在消息里。"""
+        self._isolate(monkeypatch, api_ok=True)
+        monkeypatch.setattr(
+            shutil, "which",
+            lambda cmd: "/usr/local/bin/bili" if cmd == "bili" else None,
+        )
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "ok"  # 搜索 API 兜底
+        assert ch.active_backend == "B站搜索 API"
+        assert "备选后端异常" in msg
+        assert "pipx reinstall bilibili-cli" in msg
+
+    def test_bili_broken_and_no_fallback_reports_error(self, monkeypatch):
+        self._isolate(monkeypatch, api_ok=False)
+        monkeypatch.setattr(
+            shutil, "which",
+            lambda cmd: "/usr/local/bin/bili" if cmd == "bili" else None,
+        )
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "error"
+        assert "uv tool install --force bilibili-cli" in msg
+        assert ch.active_backend is None
+
+    def test_unverified_opencli_falls_back_to_verified_api(self, monkeypatch):
+        self._isolate(
+            monkeypatch,
+            opencli=("warn", "OpenCLI 桥接已连接但未验证"),
+            api_ok=True,
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert ch.active_backend == "B站搜索 API"
+
+    def test_unverified_opencli_alone_has_no_active_backend(self, monkeypatch):
+        self._isolate(
+            monkeypatch,
+            opencli=("warn", "OpenCLI 桥接已连接但未验证"),
+            api_ok=False,
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+
+        ch = BilibiliChannel()
+        status, _ = ch.check()
+
+        assert status == "warn"
+        assert ch.active_backend is None
+
+    def test_api_only_still_ok_with_install_nudge(self, monkeypatch):
+        self._isolate(monkeypatch, api_ok=True)
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert ch.active_backend == "B站搜索 API"
+        assert "bilibili-cli" in msg
+
+    def test_off_when_everything_unreachable(self, monkeypatch):
+        self._isolate(monkeypatch, api_ok=False)
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        from agent_reach.channels.bilibili import BilibiliChannel
+        ch = BilibiliChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+
+class TestYouTubeChannel:
+    def test_reports_error_with_reinstall_hint_when_broken(self, monkeypatch):
+        """yt-dlp which 命中但 exec 抛 FileNotFoundError → error + 重装处方。"""
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/yt-dlp")
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.youtube import YouTubeChannel
+        ch = YouTubeChannel()
+        status, msg = ch.check()
+        assert status == "error"
+        assert "无法执行" in msg
+        assert "uv tool install --force yt-dlp" in msg
+        assert ch.active_backend is None
+
+
+class TestGitHubChannel:
+    def test_reports_error_with_reinstall_hint_when_broken(self, monkeypatch):
+        """gh --version 断链时给出二进制重装处方。"""
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/gh")
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[-1:] == ["--version"]
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.github import GitHubChannel
+        ch = GitHubChannel()
+        status, msg = ch.check()
+        assert status == "error"
+        assert "无法执行" in msg
+        assert "brew reinstall gh" in msg
+        assert ch.active_backend is None
+
+    def test_explicit_auth_is_unverified_and_never_marked_active(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/gh")
+        monkeypatch.setenv("GH_TOKEN", "configured-secret")
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[-1:] == ["--version"]
+            assert "auth" not in cmd
+            assert kwargs["env"]["GH_TELEMETRY"] == "false"
+            assert kwargs["env"]["DO_NOT_TRACK"] == "true"
+            return subprocess.CompletedProcess(cmd, 0, "gh version 2.92.0", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.github import GitHubChannel
+        ch = GitHubChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "显式认证配置" in msg
+        assert "configured-secret" not in msg
+        assert ch.active_backend is None
+
+    def test_no_auth_metadata_remains_warn_and_inactive(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/gh")
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[-1:] == ["--version"]
+            assert "auth" not in cmd
+            return subprocess.CompletedProcess(cmd, 0, "gh version 2.92.0", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.github import GitHubChannel
+        ch = GitHubChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "gh auth login" in msg
+        assert ch.active_backend is None
+
+    def test_hosts_metadata_is_read_without_exposing_token(
+        self, monkeypatch, isolated_home
+    ):
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/gh")
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        hosts = isolated_home / ".config" / "gh" / "hosts.yml"
+        hosts.parent.mkdir(parents=True)
+        hosts.write_text(
+            "github.com:\n"
+            "  user: alice\n"
+            "  oauth_token: super-secret-token\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 0, "gh version 2.92.0", ""
+            ),
+        )
+
+        from agent_reach.channels.github import GitHubChannel
+
+        status, message = GitHubChannel().check()
+
+        assert status == "warn"
+        assert "显式认证配置" in message
+        assert "alice" not in message
+        assert "super-secret-token" not in message
+
+    def test_hosts_metadata_refuses_ancestor_symlink(
+        self, monkeypatch, isolated_home
+    ):
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/gh")
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        real_config = isolated_home / "real-config"
+        hosts = real_config / "gh" / "hosts.yml"
+        hosts.parent.mkdir(parents=True)
+        hosts.write_text(
+            "github.com:\n  oauth_token: do-not-read\n",
+            encoding="utf-8",
+        )
+        (isolated_home / ".config").symlink_to(
+            real_config,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 0, "gh version 2.92.0", ""
+            ),
+        )
+
+        from agent_reach.channels.github import GitHubChannel
+
+        channel = GitHubChannel()
+        status, message = channel.check()
+
+        assert status == "warn"
+        assert "无法安全确认" in message
+        assert "do-not-read" not in message
+        assert channel.active_backend is None
+
+
+class TestLinkedInChannel:
+    def test_setup_hint_uses_current_stdio_contract(self, monkeypatch):
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+
+        from agent_reach.channels.linkedin import LinkedInChannel
+
+        channel = LinkedInChannel()
+        status, message = channel.check()
+
+        assert status == "off"
+        assert channel.backends[0] == "mcp-server-linkedin"
+        assert "docs.astral.sh/uv/getting-started/installation" in message
+        assert "uvx mcp-server-linkedin@latest --login" in message
+        assert (
+            "mcporter config add linkedin --command uvx "
+            "--arg mcp-server-linkedin@latest --env UV_HTTP_TIMEOUT=300 "
+            "--scope home"
+        ) in message
+        assert "pip install linkedin-scraper-mcp" not in message
+        assert "localhost:3000/mcp" not in message
+
+    def test_configured_linkedin_warns_when_uvx_is_missing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "linkedin": {
+                            "command": "uvx",
+                            "args": ["mcp-server-linkedin@latest"],
+                        }
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: "/usr/local/bin/mcporter"
+            if name == "mcporter"
+            else None,
+        )
+
+        from agent_reach.channels.linkedin import LinkedInChannel
+
+        status, message = LinkedInChannel().check()
+
+        assert status == "warn"
+        assert "uvx 未安装" in message
+        assert "docs.astral.sh/uv/getting-started/installation" in message
+
+    def test_mcporter_is_never_executed(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+        from agent_reach.channels.linkedin import LinkedInChannel
+        ch = LinkedInChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+    @pytest.mark.parametrize(
+        "server_name",
+        [
+            "linkedin",
+            "linkedin-scraper",
+            "linkedin-scraper-mcp",
+            "mcp-server-linkedin",
+        ],
+    )
+    def test_configured_linkedin_name_is_not_false_positive_active(
+        self, monkeypatch, tmp_path, server_name
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        server_name: {"command": "linkedin-mcp"}
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+        from agent_reach.channels.linkedin import LinkedInChannel
+        ch = LinkedInChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "未启动" in msg
+        assert ch.active_backend is None
+
+    def test_config_metadata_containing_linkedin_is_not_a_backend(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "unrelated": {
+                            "baseUrl": "http://linkedin-project.test/mcp"
+                        }
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        from agent_reach.channels.linkedin import LinkedInChannel
+
+        ch = LinkedInChannel()
+        status, _ = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+    def test_off_without_backend_when_linkedin_not_configured(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"exa": {"baseUrl": "https://example.test"}},
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        from agent_reach.channels.linkedin import LinkedInChannel
+        ch = LinkedInChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+
+class TestExaSearchChannel:
+    def test_mcporter_is_never_executed(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+        from agent_reach.channels.exa_search import ExaSearchChannel
+        ch = ExaSearchChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+    def test_configured_exa_is_not_false_positive_active(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "exa": {"baseUrl": "https://mcp.example.test"}
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        from agent_reach.channels.exa_search import ExaSearchChannel
+        ch = ExaSearchChannel()
+        status, msg = ch.check()
+        assert status == "warn"
+        assert "未启动" in msg
+        assert ch.active_backend is None
+
+    def test_config_metadata_containing_exa_is_not_a_backend(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "unrelated": {
+                            "baseUrl": "https://example.test/exa-project"
+                        }
+                    },
+                    "imports": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        from agent_reach.channels.exa_search import ExaSearchChannel
+
+        ch = ExaSearchChannel()
+        status, _ = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None
+
+    def test_invalid_mcporter_json_is_reported_as_error_not_unconfigured(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        config_path = tmp_path / "config" / "mcporter.json"
+        config_path.parent.mkdir()
+        config_path.write_text("not-json", encoding="utf-8")
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/mcporter")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Doctor must not execute mcporter"
+            ),
+        )
+        from agent_reach.channels.exa_search import ExaSearchChannel
+
+        ch = ExaSearchChannel()
+        status, message = ch.check()
+        assert status == "error"
+        assert "JSON" in message
+        assert ch.active_backend is None
+
+
+class TestXiaoyuzhouChannel:
+    def test_reports_error_with_reinstall_hint_when_ffmpeg_broken(self, monkeypatch):
+        """ffmpeg which 命中但 exec 失败（pip 假 ffmpeg 断链）→ error + 重装处方。"""
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/ffmpeg")
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        from agent_reach.channels.xiaoyuzhou import XiaoyuzhouChannel
+        ch = XiaoyuzhouChannel()
+        status, msg = ch.check()
+        assert status == "error"
+        assert "无法执行" in msg
+        assert "brew install ffmpeg" in msg
+        assert ch.active_backend is None
+
+    def test_active_backend_set_when_fully_configured(self, monkeypatch):
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/ffmpeg")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "ffmpeg version 7.0", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("os.path.isfile", lambda p: True)  # transcribe.sh 已安装
+        monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+        from agent_reach.channels.xiaoyuzhou import XiaoyuzhouChannel
+        ch = XiaoyuzhouChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert ch.active_backend == "groq-whisper"
+
+
+class TestRSSChannel:
+    """can_handle URL patterns + the three check() branches (ok / off / error)."""
+
+    def test_can_handle_feed_urls(self):
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        assert ch.can_handle("https://example.com/feed")
+        assert ch.can_handle("https://example.com/rss")
+        assert ch.can_handle("https://example.com/feed.xml")
+        assert ch.can_handle("https://blog.example.com/atom.xml")
+        assert ch.can_handle("https://example.com/index.atom")
+
+    def test_can_handle_is_case_insensitive(self):
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        assert ch.can_handle("https://example.com/FEED")
+        assert ch.can_handle("https://example.com/Atom.XML")
+
+    def test_can_handle_rejects_non_feed_urls(self):
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        assert not ch.can_handle("https://github.com/user/repo")
+        assert not ch.can_handle("https://example.com/blog/post-1")
+        assert not ch.can_handle("https://v2ex.com/t/123")
+
+    def test_check_ok_when_feedparser_importable(self, monkeypatch):
+        import sys
+        import types
+
+        monkeypatch.setitem(sys.modules, "feedparser", types.ModuleType("feedparser"))
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        status, msg = ch.check()
+        assert status == "ok"
+        assert ch.active_backend == "feedparser"
+
+    def test_check_off_when_feedparser_missing(self, monkeypatch):
+        """feedparser not installed → off + pip install prescription."""
+        import sys
+
+        # None in sys.modules makes `import feedparser` raise ImportError
+        monkeypatch.setitem(sys.modules, "feedparser", None)
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        status, msg = ch.check()
+        assert status == "off"
+        assert "pip install feedparser" in msg
+        assert ch.active_backend is None
+
+    def test_check_error_when_import_crashes(self, monkeypatch):
+        """Installed but crashes at import time (half-broken install) → error + reinstall prescription."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def crashing_import(name, *args, **kwargs):
+            if name == "feedparser":
+                raise RuntimeError("broken install")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", crashing_import)
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        status, msg = ch.check()
+        assert status == "error"
+        assert "--force-reinstall" in msg
+        assert ch.active_backend is None
+
+    def test_check_failure_resets_stale_active_backend(self, monkeypatch):
+        """A previously healthy instance must not keep a stale active_backend."""
+        import sys
+
+        from agent_reach.channels.rss import RSSChannel
+        ch = RSSChannel()
+        ch.active_backend = "feedparser"  # pretend an earlier check() succeeded
+        monkeypatch.setitem(sys.modules, "feedparser", None)
+        status, _ = ch.check()
+        assert status == "off"
+        assert ch.active_backend is None

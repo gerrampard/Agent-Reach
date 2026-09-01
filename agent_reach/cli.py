@@ -5,17 +5,29 @@ Agent Reach CLI — installer, doctor, and configuration tool.
 Usage:
     agent-reach install --env=auto
     agent-reach doctor
-    agent-reach configure twitter-cookies "auth_token=xxx; ct0=yyy"
+    agent-reach configure twitter-cookies
     agent-reach setup
 """
 
-import sys
 import argparse
 import json
 import os
+import sys
 import time
 
 from agent_reach import __version__
+
+# Pinned to the 0.4.2 state — PyPI still only has 0.4.1 (upstream issue #10).
+_RDT_GIT_SOURCE = "git+https://github.com/public-clis/rdt-cli.git@5e4fb3720d5c174e976cd425ccc3b879d52cac66"
+_MAX_CONFIGURE_VALUE_CHARS = 1024 * 1024
+_SENSITIVE_CONFIG_KEYS = {
+    "proxy",
+    "github-token",
+    "groq-key",
+    "openai-key",
+    "twitter-cookies",
+    "xhs-cookies",
+}
 
 
 def _ensure_utf8_console():
@@ -63,30 +75,62 @@ def main():
     p_install.add_argument("--env", choices=["local", "server", "auto"], default="auto",
                            help="Environment: local, server, or auto-detect")
     p_install.add_argument("--proxy", default="",
-                           help="Residential proxy for Reddit/Bilibili (http://user:pass@ip:port)")
-    p_install.add_argument("--safe", action="store_true",
-                           help="Safe mode: skip automatic system changes, show what's needed instead")
+                           help="Network proxy saved for agents to export as HTTP(S)_PROXY "
+                                "in restricted networks (http://user:pass@ip:port)")
+    install_mode = p_install.add_mutually_exclusive_group()
+    install_mode.add_argument(
+        "--system",
+        action="store_true",
+        help="Explicitly allow system dependency, global tool, config, and skill installation",
+    )
+    install_mode.add_argument(
+        "--safe",
+        action="store_true",
+        help="Safe check-only mode (default; retained for compatibility)",
+    )
     p_install.add_argument("--dry-run", action="store_true",
                            help="Show what would be done without making any changes")
     p_install.add_argument("--channels", default="",
                            help="Comma-separated optional channels to install "
-                                "(twitter,weibo,wechat,xiaoyuzhou,xueqiu,xiaohongshu,"
-                                "reddit,bilibili,douyin,linkedin,all)")
+                                "(twitter,xiaoyuzhou,xueqiu,xiaohongshu,"
+                                "reddit,facebook,instagram,bilibili,linkedin,all)")
 
     # ── configure ──
     p_conf = sub.add_parser("configure", help="Set a config value or auto-extract from browser")
     p_conf.add_argument("key", nargs="?", default=None,
-                        choices=["proxy", "github-token", "groq-key",
+                        choices=["proxy", "github-token", "groq-key", "openai-key",
                                  "twitter-cookies", "youtube-cookies",
                                  "xhs-cookies"],
                         help="What to configure (omit if using --from-browser)")
     p_conf.add_argument("value", nargs="*", help="The value(s) to set")
+    p_conf.add_argument(
+        "--stdin",
+        dest="read_stdin",
+        action="store_true",
+        help="Read the value from stdin instead of exposing it in process arguments",
+    )
     p_conf.add_argument("--from-browser", metavar="BROWSER",
                         choices=["chrome", "firefox", "edge", "brave", "opera"],
-                        help="Auto-extract ALL platform cookies from browser (chrome/firefox/edge/brave/opera)")
+                        help="Extract cookies for one explicitly selected platform")
+    p_conf.add_argument(
+        "--platform",
+        choices=["twitter", "xiaohongshu", "bilibili", "xueqiu"],
+        help="Platform to import (required with --from-browser)",
+    )
+    p_conf.add_argument(
+        "--profile",
+        help="Exact browser profile; a missing profile fails instead of falling back",
+    )
+    p_conf.add_argument(
+        "--sync-legacy-twitter",
+        action="store_true",
+        help="With twitter-cookies, also write legacy xfetch/bird credential files",
+    )
 
     # ── doctor ──
-    sub.add_parser("doctor", help="Check platform availability")
+    p_doctor = sub.add_parser("doctor", help="Check platform availability")
+    p_doctor.add_argument("--json", action="store_true",
+                          help="Output machine-readable JSON instead of the text report")
 
     # ── uninstall ──
     p_uninstall = sub.add_parser("uninstall", help="Remove all Agent Reach config, tokens, and skill files")
@@ -108,6 +152,22 @@ def main():
     p_format.add_argument("platform", choices=["xhs"], help="Platform to format (xhs)")
 
     # ── check-update ──
+    # ── transcribe ──
+    p_tr = sub.add_parser("transcribe", help="Transcribe a URL or local audio file (Whisper via Groq/OpenAI)")
+    p_tr.add_argument("source", help="Audio/video URL or local file path")
+    p_tr.add_argument("--provider", choices=["auto", "groq", "openai"], default="auto",
+                      help="Transcription provider (default: first configured provider)")
+    p_tr.add_argument(
+        "--allow-provider-fallback",
+        action="store_true",
+        help=(
+            "With --provider auto, allow sending audio to the next "
+            "configured provider after a failure"
+        ),
+    )
+    p_tr.add_argument("-o", "--output", default=None,
+                      help="Write transcript to a file instead of stdout")
+
     sub.add_parser("check-update", help="Check for new versions and changes")
 
     # ── watch ──
@@ -117,6 +177,43 @@ def main():
     sub.add_parser("version", help="Show version")
 
     args = parser.parse_args()
+
+    if args.command == "configure" and args.from_browser:
+        if args.read_stdin:
+            p_conf.error("--stdin cannot be combined with --from-browser")
+        if not args.platform:
+            p_conf.error("--platform is required with --from-browser")
+        manual_keys = {
+            "twitter": "twitter-cookies",
+            "xiaohongshu": "xhs-cookies",
+        }
+        if args.platform in manual_keys:
+            p_conf.error(
+                f"{args.platform} requires Cookie-Editor export; use "
+                f"`agent-reach configure {manual_keys[args.platform]} ...`"
+            )
+        if args.profile and args.from_browser not in {"chrome", "edge", "brave"}:
+            p_conf.error(
+                "--profile is supported only for Chrome/Edge/Brave"
+            )
+        if args.sync_legacy_twitter:
+            p_conf.error("--sync-legacy-twitter is only valid with twitter-cookies")
+    elif args.command == "configure":
+        if args.read_stdin and args.value:
+            p_conf.error("--stdin cannot be combined with a positional value")
+        if args.read_stdin and not args.key:
+            p_conf.error("--stdin requires a configure key")
+        if args.profile or args.platform:
+            p_conf.error("--platform/--profile require --from-browser")
+        if args.sync_legacy_twitter and args.key != "twitter-cookies":
+            p_conf.error("--sync-legacy-twitter is only valid with twitter-cookies")
+
+    if (
+        args.command == "transcribe"
+        and args.allow_provider_fallback
+        and args.provider != "auto"
+    ):
+        p_tr.error("--allow-provider-fallback requires --provider auto")
 
     # Suppress loguru noise unless --verbose
     _configure_logging(getattr(args, "verbose", False))
@@ -130,7 +227,7 @@ def main():
         sys.exit(0)
 
     if args.command == "doctor":
-        _cmd_doctor()
+        _cmd_doctor(args)
     elif args.command == "check-update":
         _cmd_check_update()
     elif args.command == "watch":
@@ -147,6 +244,8 @@ def main():
         _cmd_skill(args)
     elif args.command == "format":
         _cmd_format(args)
+    elif args.command == "transcribe":
+        _cmd_transcribe(args)
 
 
 # ── Command handlers ────────────────────────────────
@@ -155,20 +254,52 @@ def main():
 def _cmd_install(args):
     """One-shot deterministic installer."""
     import os
+
     from agent_reach.config import Config
     from agent_reach.doctor import check_all, format_report
 
-    safe_mode = args.safe
+    safe_mode = getattr(args, "safe", False) or not getattr(args, "system", False)
     dry_run = args.dry_run
 
-    config = Config()
+    # Validate channel names before constructing config or changing the system.
+    CHANNEL_INSTALLERS = {
+        "twitter":     _install_twitter_deps,
+        "xiaoyuzhou":  _install_xiaoyuzhou_deps,
+        "xiaohongshu": _install_xhs_deps,
+        "reddit":      _install_reddit_deps,
+        "facebook":    _install_opencli_deps,
+        "instagram":   _install_opencli_deps,
+        "bilibili":    _install_bili_deps,
+        "opencli":     _install_opencli_deps,  # cross-channel backend, desktop only
+        # xueqiu: cookie-only, no install step
+        # linkedin: manual setup, no auto-install
+    }
+    supported_channels = set(CHANNEL_INSTALLERS) | {"xueqiu", "linkedin"}
+    raw_channels = [
+        channel.strip().lower()
+        for channel in args.channels.split(",")
+        if channel.strip()
+    ]
+    unknown_channels = set(raw_channels) - supported_channels - {"all"}
+    if unknown_channels:
+        supported = ", ".join(sorted(supported_channels | {"all"}))
+        unknown = ", ".join(sorted(unknown_channels))
+        print(
+            f"agent-reach install: error: unknown channel(s): {unknown}. "
+            f"Supported: {supported}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if "all" in raw_channels:
+        requested_channels = supported_channels
+    else:
+        requested_channels = set(raw_channels)
+
+    config = Config(read_only=dry_run or safe_mode)
     print()
     print("Agent Reach Installer")
     print("=" * 40)
-
-    # Ensure tools directory exists (for upstream tool repos)
-    tools_dir = os.path.expanduser("~/.agent-reach/tools")
-    os.makedirs(tools_dir, exist_ok=True)
 
     if dry_run:
         print("DRY RUN — showing what would be done (no changes)")
@@ -177,27 +308,13 @@ def _cmd_install(args):
         print("SAFE MODE — skipping automatic system changes")
         print()
 
-    # ── Parse --channels ──
-    CHANNEL_INSTALLERS = {
-        "twitter":     _install_twitter_deps,
-        "weibo":       _install_weibo_deps,
-        "wechat":      _install_wechat_deps,
-        "xiaoyuzhou":  _install_xiaoyuzhou_deps,
-        "xiaohongshu": _install_xhs_deps,
-        "reddit":      _install_reddit_deps,
-        "bilibili":    _install_bili_deps,
-        # xueqiu: cookie-only, no install step
-        # douyin/linkedin: manual setup, no auto-install
-    }
-    COOKIE_CHANNELS = {"twitter", "xueqiu", "bilibili"}
+    # Only a real installation may create persistent directories.
+    if not dry_run and not safe_mode:
+        tools_dir = os.path.expanduser("~/.agent-reach/tools")
+        os.makedirs(tools_dir, exist_ok=True)
 
-    requested_channels = set()
-    if args.channels:
-        raw = [c.strip().lower() for c in args.channels.split(",") if c.strip()]
-        if "all" in raw:
-            requested_channels = set(CHANNEL_INSTALLERS.keys()) | {"xueqiu", "douyin", "linkedin"}
-        else:
-            requested_channels = set(raw)
+    OPENCLI_ONLY_CHANNELS = {"opencli", "facebook", "instagram"}
+    COOKIE_CHANNELS = {"twitter", "xueqiu", "bilibili", "xiaohongshu"}
 
     # Auto-detect environment
     env = args.env
@@ -205,26 +322,35 @@ def _cmd_install(args):
         env = _detect_environment()
 
     if env == "server":
-        print(f"Environment: Server/VPS (auto-detected)")
+        print("Environment: Server/VPS (auto-detected)")
     else:
-        print(f"Environment: Local computer (auto-detected)")
+        print("Environment: Local computer (auto-detected)")
+
+    server_skipped_opencli_channels = set()
+    if env == "server" and requested_channels:
+        # OpenCLI rides a real desktop Chrome session — useless headless
+        server_skipped_opencli_channels = requested_channels & OPENCLI_ONLY_CHANNELS
+        requested_channels -= server_skipped_opencli_channels
 
     # Apply explicit flags
     if args.proxy:
-        if dry_run:
-            print(f"[dry-run] Would configure proxy for Bilibili")
+        if dry_run or safe_mode:
+            mode = "dry-run" if dry_run else "safe"
+            print(f"[{mode}] Would save network proxy")
         else:
-            config.set("bilibili_proxy", args.proxy)
-            print(f"✅ Proxy configured for Bilibili")
+            config.set("proxy", args.proxy)
+            config.set("bilibili_proxy", args.proxy)  # legacy key
+            print("✅ 代理已保存（Agent 访问受限网络时使用）")
 
     # ── Install core system dependencies (lightweight, always) ──
     print()
+    core_install_ok = True
     if dry_run:
         _install_system_deps_dryrun()
     elif safe_mode:
         _install_system_deps_safe()
     else:
-        _install_system_deps()
+        core_install_ok = _install_system_deps() is not False
 
     # ── mcporter (for Exa search) ──
     print()
@@ -233,56 +359,59 @@ def _cmd_install(args):
     elif safe_mode:
         _install_mcporter_safe()
     else:
-        _install_mcporter()
+        core_install_ok = (_install_mcporter() is not False) and core_install_ok
+
+    if server_skipped_opencli_channels:
+        print()
+        print("  -- OpenCLI 需要桌面环境 + Chrome，服务器环境跳过："
+              f"{', '.join(sorted(server_skipped_opencli_channels))}")
 
     # ── Install optional channels (only if --channels specified) ──
     if requested_channels and not dry_run and not safe_mode:
         print()
         print("Installing optional channels...")
+        ran_installers = set()
+        optional_install_ok = True
         for ch_name in sorted(requested_channels):
             installer = CHANNEL_INSTALLERS.get(ch_name)
-            if installer:
-                installer()
+            if installer and installer not in ran_installers:
+                optional_install_ok = (
+                    installer() is not False
+                ) and optional_install_ok
+                ran_installers.add(installer)
+    else:
+        optional_install_ok = True
 
     if requested_channels and dry_run:
         print()
         print(f"[dry-run] Would install optional channels: {', '.join(sorted(requested_channels))}")
 
-    # ── Auto-import cookies (only if cookie-needing channels are requested) ──
+    # ── Cookie setup (explicit only — install never reads browser credentials) ──
     needs_cookies = bool(requested_channels & COOKIE_CHANNELS)
-    if env == "local" and needs_cookies and not safe_mode and not dry_run:
+    if env == "local" and needs_cookies and not dry_run:
         print()
-        print("Importing cookies from browser...")
-        print("  (macOS may ask for your login password to access the Keychain — this is normal,")
-        print("   it only happens once during install. Enter your password or click 'Allow'.)")
-        try:
-            from agent_reach.cookie_extract import configure_from_browser
-            results = configure_from_browser("chrome", config)
-            found = False
-            for platform, success, message in results:
-                if success:
-                    print(f"  ✅ {platform}: {message}")
-                    found = True
-            if not found:
-                results = configure_from_browser("firefox", config)
-                for platform, success, message in results:
-                    if success:
-                        print(f"  ✅ {platform}: {message}")
-                        found = True
-            if not found:
-                print("  -- No cookies found (normal if you haven't logged into these sites)")
-        except Exception:
-            print("  -- Could not read browser cookies (browser might be open or password was denied)")
+        print("Cookie login is never read automatically.")
+        print("Run only the platform command you intend to authorize:")
+        for channel in sorted(requested_channels & COOKIE_CHANNELS):
+            if channel == "twitter":
+                print("  agent-reach configure twitter-cookies")
+            elif channel == "xiaohongshu":
+                print("  agent-reach configure xhs-cookies")
+            else:
+                print(
+                    "  agent-reach configure --from-browser chrome "
+                    f"--platform {channel}"
+                )
     elif env == "local" and needs_cookies and dry_run:
         print()
-        print("[dry-run] Would try to import cookies from Chrome/Firefox")
+        print("[dry-run] Cookie import remains explicit; install will not read a browser")
 
     # Environment-specific advice
     if env == "server":
         print()
-        print("Tip: Bilibili may block server IPs.")
-        print("   Reddit: rdt-cli works without proxy (pipx install rdt-cli).")
-        print("   For Bilibili full access: agent-reach configure proxy http://user:pass@ip:port")
+        print("Tip: 部分平台对服务器 IP 有风控。")
+        print("   Reddit 必须登录态（rdt-cli + Cookie，见 doctor 提示），中国大陆网络还需代理。")
+        print("   保存代理供 Agent 使用：agent-reach configure proxy（隐藏输入）")
         print("   Cheap option: https://www.webshare.io ($1/month)")
 
     # Test channels
@@ -298,33 +427,50 @@ def _cmd_install(args):
         print(format_report(results))
         print()
 
-        # ── Install agent skill ──
-        _install_skill()
+        if safe_mode:
+            print(
+                "Safe mode check complete. No changes were made. "
+                f"{ok}/{total} channels active."
+            )
+        else:
+            # ── Install agent skill ──
+            skill_install_ok = _install_skill() is not False
+            install_ok = (
+                core_install_ok and optional_install_ok and skill_install_ok
+            )
 
-        print(f"✅ Installation complete! {ok}/{total} channels active.")
+            if install_ok:
+                print(f"Installation complete. {ok}/{total} channels active.")
+            else:
+                print(
+                    "Installation incomplete: one or more requested "
+                    f"steps failed. {ok}/{total} channels active."
+                )
 
-        if not requested_channels:
-            # First install — hint about optional channels
+            if not requested_channels:
+                # First install — hint about optional channels
+                print()
+                print("More channels available! Use --channels to install:")
+                print("   agent-reach install --system --channels=twitter,xiaohongshu,reddit,facebook,instagram,...")
+                print("   agent-reach install --system --channels=all  (install everything)")
+
+            # Star reminder
             print()
-            print("More channels available! Use --channels to install:")
-            print("   agent-reach install --channels=twitter,weibo,xiaohongshu,...")
-            print("   agent-reach install --channels=all  (install everything)")
-
-        # Star reminder
-        print()
-        print("如果 Agent Reach 帮到了你，给个 Star 让更多人发现它吧：")
-        print("   https://github.com/Panniantong/Agent-Reach")
-        print("   只需一秒，对独立开发者意义很大。谢谢！")
+            print("如果 Agent Reach 帮到了你，给个 Star 让更多人发现它吧：")
+            print("   https://github.com/Panniantong/Agent-Reach")
+            print("   只需一秒，对独立开发者意义很大。谢谢！")
+            if not install_ok:
+                raise SystemExit(1)
     else:
         print()
         print("Dry run complete. No changes were made.")
 
 
-def _install_skill():
-    """Install Agent Reach as an agent skill (OpenClaw / Claude Code / .agents)."""
+def _install_skill(force: bool = True):
+    """Install Agent Reach as an agent skill for supported agent clients."""
+    import importlib.resources
     import os
     import shutil
-    import importlib.resources
 
     def _is_english_locale(value: str) -> bool:
         normalized = value.strip().lower()
@@ -348,11 +494,17 @@ def _install_skill():
         except FileNotFoundError:
             return skill_pkg.joinpath("SKILL.md").read_text(encoding="utf-8")
 
-    def _copy_skill_dir(target: str) -> bool:
+    def _copy_skill_dir(target: str) -> str | None:
         """Copy entire skill directory (locale-specific SKILL.md + references/)."""
         try:
-            # Clear existing installation
-            if os.path.exists(target):
+            if not force and os.path.exists(os.path.join(target, "SKILL.md")):
+                return "preserved"
+
+            # Clear existing installation. A symlinked skill dir (dotfiles
+            # setups) breaks shutil.rmtree — unlink the link itself instead.
+            if os.path.islink(target):
+                os.unlink(target)
+            elif os.path.exists(target):
                 shutil.rmtree(target)
             os.makedirs(target, exist_ok=True)
 
@@ -381,41 +533,56 @@ def _install_skill():
                     with open(os.path.join(refs_target, name), "w", encoding="utf-8") as f:
                         f.write(content)
 
-            return True
+            return "installed"
         except Exception as e:
             print(f"  Warning: Could not install skill: {e}")
-            return False
+            return None
 
-    # Determine skill install path (priority: .agents > openclaw > claude)
+    # Install into every known skill root that already exists.
     skill_dirs = [
-        os.path.expanduser("~/.agents/skills"),      # Generic agents (priority)
-        os.path.expanduser("~/.openclaw/skills"),    # OpenClaw
-        os.path.expanduser("~/.claude/skills"),      # Claude Code (if exists)
+        (os.path.expanduser("~/.agents/skills"), "Agent"),
+        (os.path.expanduser("~/.config/opencode/skills"), "OpenCode"),
+        (os.path.expanduser("~/.openclaw/skills"), "OpenClaw"),
+        (os.path.expanduser("~/.claude/skills"), "Claude Code"),
     ]
 
     # Insert OPENCLAW_HOME path at the beginning if environment variable is set
     openclaw_home = os.environ.get("OPENCLAW_HOME")
     if openclaw_home:
-        skill_dirs.insert(0, os.path.join(openclaw_home, ".openclaw", "skills"))
+        skill_dirs.insert(
+            0,
+            (os.path.join(openclaw_home, ".openclaw", "skills"), "OpenClaw"),
+        )
 
     installed = False
-    for skill_dir in skill_dirs:
+    for skill_dir, platform_name in skill_dirs:
         if os.path.isdir(skill_dir):
             target = os.path.join(skill_dir, "agent-reach")
-            if _copy_skill_dir(target):
-                platform_name = "Agent" if ".agents" in skill_dir else "OpenClaw" if "openclaw" in skill_dir else "Claude Code"
-                print(f"Skill installed for {platform_name}: {target}")
+            status = _copy_skill_dir(target)
+            if status:
+                if status == "preserved":
+                    print(f"Skill already installed for {platform_name}, preserving existing files: {target}")
+                else:
+                    print(f"Skill installed for {platform_name}: {target}")
                 installed = True
 
     if not installed:
         # No known skill directory found — create for .agents by default
         target = os.path.expanduser("~/.agents/skills/agent-reach")
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        if _copy_skill_dir(target):
+        status = _copy_skill_dir(target)
+        if status == "preserved":
+            print(f"Skill already installed, preserving existing files: {target}")
+        elif status == "installed":
             print(f"Skill installed: {target}")
+            installed = True
         else:
             print("  -- Could not install agent skill (optional)")
-            print("  -- Tip: install OpenClaw, Claude Code, or create ~/.agents/skills/ manually")
+            print(
+                "  -- Tip: install OpenCode, OpenClaw, Claude Code, "
+                "or create ~/.agents/skills/ manually"
+            )
+    return installed
 
 
 def _uninstall_skill():
@@ -423,6 +590,7 @@ def _uninstall_skill():
     import shutil
 
     skill_dirs = [
+        ("~/.config/opencode/skills/agent-reach", "OpenCode"),
         ("~/.openclaw/skills/agent-reach", "OpenClaw"),
         ("~/.claude/skills/agent-reach", "Claude Code"),
         ("~/.agents/skills/agent-reach", "Agent"),
@@ -441,7 +609,10 @@ def _uninstall_skill():
         skill_path = os.path.expanduser(skill_path_template)
         if os.path.isdir(skill_path):
             try:
-                shutil.rmtree(skill_path)
+                if os.path.islink(skill_path):
+                    os.unlink(skill_path)
+                else:
+                    shutil.rmtree(skill_path)
                 print(f"  Removed {platform_name} skill: {skill_path}")
                 removed = True
             except Exception as e:
@@ -454,7 +625,8 @@ def _uninstall_skill():
 def _cmd_skill(args):
     """Manage agent skill registration."""
     if args.install:
-        _install_skill()
+        if not _install_skill():
+            raise SystemExit(1)
     elif args.uninstall:
         _uninstall_skill()
 
@@ -482,136 +654,259 @@ def _cmd_format(args):
 
 
 def _install_system_deps():
-    """Install system-level dependencies: gh CLI, Node.js (for mcporter)."""
+    """Install system dependencies through an existing OS package manager."""
+    import platform
     import shutil
     import subprocess
-    import platform
-    import tempfile
 
     print("Checking system dependencies...")
 
-    # ── gh CLI ──
-    if shutil.which("gh"):
-        print("  ✅ gh CLI already installed")
-    else:
-        print("  Installing gh CLI...")
-        os_type = platform.system().lower()
-        if os_type == "linux":
-            try:
-                # Official GitHub apt source setup without invoking a shell.
-                keyring_path = "/usr/share/keyrings/githubcli-archive-keyring.gpg"
-                list_path = "/etc/apt/sources.list.d/github-cli.list"
-                arch = subprocess.run(
-                    ["dpkg", "--print-architecture"],
-                    capture_output=True, encoding="utf-8", errors="replace", timeout=10,
-                ).stdout.strip() or "amd64"
-                subprocess.run(
-                    ["curl", "-fsSL", "https://cli.github.com/packages/githubcli-archive-keyring.gpg", "-o", keyring_path],
-                    capture_output=True, timeout=60,
-                )
-                repo_line = (
-                    f"deb [arch={arch} signed-by={keyring_path}] "
-                    "https://cli.github.com/packages stable main\n"
-                )
-                with open(list_path, "w", encoding="utf-8") as f:
-                    f.write(repo_line)
-                subprocess.run(["apt-get", "update", "-qq"], capture_output=True, timeout=60)
-                subprocess.run(["apt-get", "install", "-y", "-qq", "gh"], capture_output=True, timeout=60)
-                if shutil.which("gh"):
-                    print("  ✅ gh CLI installed")
-                else:
-                    print("  [!]  gh CLI install failed. You can try: snap install gh, or download from https://github.com/cli/cli/releases")
-            except Exception:
-                print("  [!]  gh CLI install failed. You can try: snap install gh, or download from https://github.com/cli/cli/releases")
-        elif os_type == "darwin":
-            if shutil.which("brew"):
-                try:
-                    subprocess.run(["brew", "install", "gh"], capture_output=True, timeout=120)
-                    if shutil.which("gh"):
-                        print("  ✅ gh CLI installed")
-                    else:
-                        print("  [!]  gh CLI install failed. Try: brew install gh")
-                except Exception:
-                    print("  [!]  gh CLI install failed. Try: brew install gh")
-            else:
-                print("  [!]  gh CLI not found. Install: https://cli.github.com")
-        else:
-            print("  [!]  gh CLI not found. Install: https://cli.github.com")
+    gh_installed = bool(shutil.which("gh"))
+    node_installed = bool(shutil.which("node") and shutil.which("npm"))
 
-    # ── Node.js (needed for mcporter) ──
-    if shutil.which("node") and shutil.which("npm"):
+    if gh_installed:
+        print("  ✅ gh CLI already installed")
+    if node_installed:
         print("  ✅ Node.js already installed")
-    else:
-        print("  Installing Node.js...")
-        try:
-            # Use NodeSource setup script without invoking a shell pipeline.
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".sh") as tf:
-                script_path = tf.name
-            subprocess.run(
-                ["curl", "-fsSL", "https://deb.nodesource.com/setup_22.x", "-o", script_path],
-                capture_output=True, timeout=60,
+
+    missing_labels = []
+    if not gh_installed:
+        missing_labels.append("gh CLI")
+    if not node_installed:
+        missing_labels.append("Node.js")
+    system_install_ok = not missing_labels
+
+    os_type = platform.system().lower()
+    if missing_labels and os_type == "linux":
+        apt_get = shutil.which("apt-get")
+        if not apt_get:
+            system_install_ok = False
+            print(
+                "  [!]  Missing system dependencies: "
+                f"{', '.join(missing_labels)}. apt-get is not available; "
+                "install them manually."
             )
-            subprocess.run(
-                ["bash", script_path],
-                capture_output=True, timeout=120,
-            )
+        else:
+            packages = []
+            if not gh_installed:
+                packages.append("gh")
+            if not node_installed:
+                packages.extend(("nodejs", "npm"))
+            print(f"  Installing {', '.join(missing_labels)} with apt-get...")
             try:
-                os.unlink(script_path)
-            except Exception:
-                pass
-            subprocess.run(
-                ["apt-get", "install", "-y", "-qq", "nodejs"],
-                capture_output=True, timeout=120,
+                update_result = subprocess.run(
+                    [apt_get, "update", "-qq"],
+                    capture_output=True,
+                    timeout=120,
+                )
+                if update_result.returncode != 0:
+                    system_install_ok = False
+                    print(
+                        "  [!]  apt-get update failed; no packages were installed."
+                    )
+                else:
+                    install_result = subprocess.run(
+                        [apt_get, "install", "-y", "-qq", *packages],
+                        capture_output=True,
+                        timeout=180,
+                    )
+                    if install_result.returncode == 0:
+                        system_install_ok = True
+                        print(
+                            "  ✅ Installed with apt-get: "
+                            f"{', '.join(missing_labels)}"
+                        )
+                    else:
+                        system_install_ok = False
+                        print(
+                            "  [!]  apt-get install failed for: "
+                            f"{', '.join(missing_labels)}"
+                        )
+            except (OSError, subprocess.TimeoutExpired):
+                system_install_ok = False
+                print(
+                    "  [!]  apt-get failed for: "
+                    f"{', '.join(missing_labels)}"
+                )
+    elif missing_labels and os_type == "darwin":
+        brew = shutil.which("brew")
+        if not brew:
+            system_install_ok = False
+            print(
+                "  [!]  Missing system dependencies: "
+                f"{', '.join(missing_labels)}. Homebrew is not available; "
+                "install them manually."
             )
-            if shutil.which("node"):
-                print("  ✅ Node.js installed")
-            else:
-                print("  [!]  Node.js install failed. Try: apt install nodejs npm, or nvm install 22, or download from https://nodejs.org")
-        except Exception:
-            print("  [!]  Node.js install failed. Try: apt install nodejs npm, or nvm install 22, or download from https://nodejs.org")
+        else:
+            system_install_ok = True
+            brew_packages = []
+            if not gh_installed:
+                brew_packages.append(("gh", "gh CLI"))
+            if not node_installed:
+                brew_packages.append(("node", "Node.js"))
+            for package, label in brew_packages:
+                print(f"  Installing {label} with Homebrew...")
+                try:
+                    undici_result = subprocess.run(
+                        [brew, "install", package],
+                        capture_output=True,
+                        timeout=180,
+                    )
+                    if undici_result.returncode == 0:
+                        print(f"  ✅ {label} installed")
+                    else:
+                        system_install_ok = False
+                        print(f"  [!]  {label} install failed")
+                except (OSError, subprocess.TimeoutExpired):
+                    system_install_ok = False
+                    print(f"  [!]  {label} install failed")
+    elif missing_labels:
+        system_install_ok = False
+        print(
+            "  [!]  Missing system dependencies: "
+            f"{', '.join(missing_labels)}. Install them manually."
+        )
 
     # ── undici (proxy support for Node.js fetch) ──
     npm_cmd = shutil.which("npm")
     if npm_cmd:
-        npm_root = subprocess.run([npm_cmd, "root", "-g"], capture_output=True, encoding="utf-8", errors="replace", timeout=5).stdout.strip()
-        undici_path = os.path.join(npm_root, "undici", "index.js") if npm_root else ""
-        if os.path.exists(undici_path):
-            print("  ✅ undici already installed (Node.js proxy support)")
+        try:
+            npm_root_result = subprocess.run(
+                [npm_cmd, "root", "-g"],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            npm_root_result = None
+
+        if npm_root_result is None or npm_root_result.returncode != 0:
+            print(
+                "  -- Could not inspect global npm packages; "
+                "skipping optional undici install"
+            )
         else:
-            try:
-                subprocess.run([npm_cmd, "install", "-g", "undici"], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
-                print("  ✅ undici installed (Node.js proxy support)")
-            except Exception:
-                print("  -- undici install failed (optional — may not work behind proxies)")
+            npm_root = npm_root_result.stdout.strip()
+            undici_path = (
+                os.path.join(npm_root, "undici", "index.js")
+                if npm_root
+                else ""
+            )
+            if os.path.exists(undici_path):
+                print("  ✅ undici already installed (Node.js proxy support)")
+            else:
+                try:
+                    result = subprocess.run(
+                        [npm_cmd, "install", "-g", "undici"],
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=60,
+                    )
+                    if result.returncode == 0:
+                        print("  ✅ undici installed (Node.js proxy support)")
+                    else:
+                        print(
+                            "  -- undici install failed "
+                            "(optional — may not work behind proxies)"
+                        )
+                except (OSError, subprocess.TimeoutExpired):
+                    print(
+                        "  -- undici install failed "
+                        "(optional — may not work behind proxies)"
+                    )
 
     # ── yt-dlp JS runtime config (YouTube requires external JS runtime) ──
-    if shutil.which("node"):
-        ytdlp_config_dir = os.path.expanduser("~/.config/yt-dlp")
-        ytdlp_config = os.path.join(ytdlp_config_dir, "config")
-        needs_config = True
-        if os.path.exists(ytdlp_config):
-            with open(ytdlp_config, "r") as f:
-                if "--js-runtimes" in f.read():
-                    needs_config = False
-                    print("  ✅ yt-dlp JS runtime already configured")
-        if needs_config:
-            try:
-                os.makedirs(ytdlp_config_dir, exist_ok=True)
-                with open(ytdlp_config, "a") as f:
-                    f.write("--js-runtimes node\n")
-                print("  ✅ yt-dlp configured to use Node.js as JS runtime (YouTube)")
-            except Exception:
-                print("  -- Could not configure yt-dlp JS runtime (YouTube may not work)")
+    if shutil.which("deno"):
+        print("  ✅ yt-dlp can use the installed Deno JS runtime")
+    elif shutil.which("node"):
+        from agent_reach.channels.youtube import (
+            _JS_RUNTIMES_SUPPORTED_FROM,
+            _parse_ytdlp_version,
+        )
+        from agent_reach.utils.paths import (
+            PrivatePathError,
+            atomic_write_private_text,
+            get_ytdlp_config_path,
+            read_small_text_no_follow,
+        )
 
-    # NOTE: twitter-cli, weibo, xiaoyuzhou, wechat, xhs-cli etc. are optional.
+        ytdlp_cmd = shutil.which("yt-dlp")
+        installed_version = None
+        if ytdlp_cmd:
+            try:
+                version_result = subprocess.run(
+                    [ytdlp_cmd, "--version"],
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                if version_result.returncode == 0:
+                    installed_version = _parse_ytdlp_version(
+                        version_result.stdout.strip()
+                    )
+            except (OSError, subprocess.TimeoutExpired):
+                installed_version = None
+
+        if (
+            installed_version is None
+            or installed_version < _JS_RUNTIMES_SUPPORTED_FROM
+        ):
+            print(
+                "  -- 未写入 yt-dlp JS runtime 配置：yt-dlp 缺失、过旧或"
+                "版本无法确认。先升级：python -m pip install -U "
+                '"yt-dlp[default]"'
+            )
+        else:
+            ytdlp_config = get_ytdlp_config_path()
+            try:
+                existing_config = read_small_text_no_follow(
+                    ytdlp_config,
+                    max_bytes=1024 * 1024,
+                )
+                if (
+                    existing_config is not None
+                    and "--js-runtimes" in existing_config
+                ):
+                    print("  ✅ yt-dlp JS runtime already configured")
+                else:
+                    existing_config = existing_config or ""
+                    separator = (
+                        ""
+                        if not existing_config
+                        or existing_config.endswith(("\n", "\r"))
+                        else "\n"
+                    )
+                    atomic_write_private_text(
+                        ytdlp_config,
+                        existing_config
+                        + separator
+                        + "--js-runtimes node\n",
+                    )
+                    print(
+                        "  ✅ yt-dlp configured to use Node.js as JS runtime "
+                        "(YouTube)"
+                    )
+            except (OSError, UnicodeError, ValueError, PrivatePathError):
+                print(
+                    "  -- Could not configure yt-dlp JS runtime "
+                    "(YouTube may not work)"
+                )
+
+    # NOTE: twitter-cli, xiaoyuzhou, xhs-cli etc. are optional.
     # They are installed via --channels flag, not here.
     # See CHANNEL_INSTALLERS in _cmd_install().
+    return system_install_ok
 
 
 def _install_xiaoyuzhou_deps():
     """Install Xiaoyuzhou podcast transcription script."""
     import shutil
+
     from agent_reach.config import Config
+    from agent_reach.utils.paths import PrivatePathError, atomic_write_private_text
 
     config = Config()
     print("Setting up Xiaoyuzhou podcast transcription...")
@@ -619,25 +914,30 @@ def _install_xiaoyuzhou_deps():
     tools_dir = os.path.expanduser("~/.agent-reach/tools/xiaoyuzhou")
     script_dst = os.path.join(tools_dir, "transcribe.sh")
 
-    if os.path.isfile(script_dst):
-        print("  ✅ Xiaoyuzhou transcription script already installed")
+    script_src = os.path.join(
+        os.path.dirname(__file__),
+        "scripts",
+        "transcribe_xiaoyuzhou.sh",
+    )
+    script_ok = False
+    if os.path.isfile(script_src):
+        existed = os.path.isfile(script_dst)
+        try:
+            with open(script_src, encoding="utf-8") as source:
+                script_text = source.read()
+            atomic_write_private_text(script_dst, script_text)
+            os.chmod(script_dst, 0o700)
+            action = "updated" if existed else "installed"
+            print(f"  ✅ Xiaoyuzhou transcription script {action}")
+            script_ok = True
+        except (OSError, UnicodeError, PrivatePathError) as exc:
+            print(f"  [!]  Failed to install script: {exc}")
     else:
-        # Copy script from package
-        script_src = os.path.join(os.path.dirname(__file__), "scripts", "transcribe_xiaoyuzhou.sh")
-        if os.path.isfile(script_src):
-            try:
-                os.makedirs(tools_dir, exist_ok=True)
-                import shutil as _shutil
-                _shutil.copy2(script_src, script_dst)
-                os.chmod(script_dst, 0o755)
-                print("  ✅ Xiaoyuzhou transcription script installed")
-            except Exception as e:
-                print(f"  [!]  Failed to install script: {e}")
-        else:
-            print("  [!]  Script source not found in package")
+        print("  [!]  Script source not found in package")
 
     # Check ffmpeg
-    if shutil.which("ffmpeg"):
+    ffmpeg_ok = bool(shutil.which("ffmpeg"))
+    if ffmpeg_ok:
         print("  ✅ ffmpeg available")
     else:
         print("  -- ffmpeg not found. Install: apt install -y ffmpeg (or brew install ffmpeg)")
@@ -648,7 +948,8 @@ def _install_xiaoyuzhou_deps():
         print("  ✅ Groq API key configured")
     else:
         print("  -- Groq API key not set. Get free key at https://console.groq.com")
-        print("     Then run: agent-reach configure groq-key gsk_xxxxx")
+        print("     Then run: agent-reach configure groq-key（隐藏输入）")
+    return script_ok and ffmpeg_ok
 
 
 def _install_twitter_deps():
@@ -659,65 +960,158 @@ def _install_twitter_deps():
     print("Setting up Twitter (twitter-cli)...")
     if shutil.which("twitter"):
         print("  ✅ twitter-cli already installed")
-        return
-    for tool, cmd in [("pipx", ["pipx", "install", "twitter-cli"]),
-                      ("uv", ["uv", "tool", "install", "twitter-cli"])]:
-        if shutil.which(tool):
+        return True
+    for tool, args in [
+        ("pipx", ["install", "twitter-cli"]),
+        ("uv", ["tool", "install", "twitter-cli"]),
+    ]:
+        tool_cmd = shutil.which(tool)
+        if tool_cmd:
             try:
-                subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                               errors="replace", timeout=120)
-                if shutil.which("twitter"):
+                result = subprocess.run(
+                    [tool_cmd, *args], capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                )
+                if result.returncode == 0 and shutil.which("twitter"):
                     print("  ✅ twitter-cli installed")
-                    return
-            except Exception:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
                 pass
     print("  [!]  twitter-cli install failed. Run: pipx install twitter-cli")
+    return False
 
 
 def _install_xhs_deps():
-    """Install xhs-cli (xiaohongshu-cli) for XiaoHongShu."""
+    """Set up XiaoHongShu — backend depends on environment.
+
+    Desktop: OpenCLI (reuses the browser session, zero config).
+    Server: xiaohongshu-mcp guide with an explicit Cookie-Editor export;
+    we don't manage long-running services, so guide only.
+    xhs-cli is no longer installed by default — upstream unmaintained
+    since 2026-03; existing installs keep working as a fallback backend.
+    """
+    import shutil
+
+    print("Setting up XiaoHongShu...")
+    if _detect_environment() == "server":
+        print("  服务器环境推荐 xiaohongshu-mcp：")
+        print("    1. 下载 binary：https://github.com/xpzouying/xiaohongshu-mcp/releases")
+        print("       （建议放到 ~/.agent-reach/tools/ 下）")
+        print("    2. 启动服务（首次运行会下载约 150MB 浏览器，请等待完成）")
+        print("    3. 用 Cookie-Editor 从 xiaohongshu.com 明确导出 Cookie")
+        print("       agent-reach configure xhs-cookies（粘贴到隐藏输入提示）")
+        print("    4. 接入：mcporter config add xiaohongshu http://localhost:18060/mcp --scope home")
+        print("    5. 验证：agent-reach doctor")
+        return False
+
+    opencli_ok = _install_opencli_deps()
+    xhs_ok = bool(shutil.which("xhs"))
+    if xhs_ok:
+        print("  ✅ 检测到存量 xhs-cli，将作为备选后端继续可用")
+    return opencli_ok or xhs_ok
+
+
+def _install_opencli_deps():
+    """Install OpenCLI — cross-platform backend riding the user's Chrome session.
+
+    Desktop-only. The npm package installs automatically; the Chrome
+    extension CANNOT be installed programmatically (Chrome security model),
+    so we print a one-click guide instead.
+    """
     import shutil
     import subprocess
 
-    print("Setting up XiaoHongShu (xhs-cli)...")
-    if shutil.which("xhs"):
-        print("  ✅ xhs-cli already installed")
-        return
-    for tool, cmd in [("pipx", ["pipx", "install", "xiaohongshu-cli"]),
-                      ("uv", ["uv", "tool", "install", "xiaohongshu-cli"])]:
-        if shutil.which(tool):
-            try:
-                subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                               errors="replace", timeout=120)
-                if shutil.which("xhs"):
-                    print("  ✅ xhs-cli installed (run `xhs login` to authenticate)")
-                    return
-            except Exception:
-                pass
-    print("  [!]  xhs-cli install failed. Run: pipx install xiaohongshu-cli")
+    from agent_reach.backends import (
+        OPENCLI_EXTENSION_URL,
+        OPENCLI_PACKAGE,
+        opencli_status,
+        opencli_summary,
+    )
+
+    print("Setting up OpenCLI (browser-session backend, desktop only)...")
+    st = opencli_status()
+    if st.installed and not st.broken:
+        print(f"  ✅ {opencli_summary(st)}")
+        if not st.ready:
+            print(f"  {st.hint}")
+        return True
+
+    npm_cmd = shutil.which("npm")
+    if not npm_cmd:
+        print("  [!]  OpenCLI requires Node.js ≥ 20. Install Node first:")
+        print("       https://nodejs.org  （或 brew install node）")
+        return False
+
+    try:
+        install_result = subprocess.run(
+            [npm_cmd, "install", "-g", OPENCLI_PACKAGE],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        install_result = None
+
+    st = opencli_status()
+    if (
+        install_result is not None
+        and install_result.returncode == 0
+        and st.installed
+        and not st.broken
+    ):
+        print("  ✅ OpenCLI installed")
+        print("  最后一步（必须手动，Chrome 安全限制）：安装浏览器扩展")
+        print(f"    1. 打开 {OPENCLI_EXTENSION_URL}")
+        print("    2. 点「添加至 Chrome」")
+        print("    3. 运行 `opencli doctor` 验证连接")
+        return True
+    else:
+        print(f"  [!]  OpenCLI install failed. Run: npm install -g {OPENCLI_PACKAGE}")
+        return False
 
 
 def _install_reddit_deps():
-    """Install rdt-cli for Reddit search + reading."""
+    """Set up Reddit — desktop prefers OpenCLI, rdt-cli for servers/legacy.
+
+    No zero-config path exists (anonymous .json blocked, official API
+    approval-gated since 2025-11) — every backend needs a logged-in session.
+    """
+    if _detect_environment() != "server":
+        installed = _install_opencli_deps()
+        print("  Reddit 走 OpenCLI（浏览器里登录过 reddit.com 即可用）")
+        import shutil
+        if shutil.which("rdt"):
+            print("  ✅ 检测到存量 rdt-cli，将作为备选后端继续可用")
+        return installed
+
+    return _install_rdt_cli()
+
+
+def _install_rdt_cli():
+    """Install rdt-cli (pinned git source — PyPI lags upstream)."""
     import shutil
     import subprocess
 
     print("Setting up Reddit (rdt-cli)...")
     if shutil.which("rdt"):
         print("  ✅ rdt-cli already installed")
-        return
-    for tool, cmd in [("pipx", ["pipx", "install", "rdt-cli"]),
-                      ("uv", ["uv", "tool", "install", "rdt-cli"])]:
-        if shutil.which(tool):
+        return True
+    for tool, args in [
+        ("pipx", ["install", _RDT_GIT_SOURCE]),
+        ("uv", ["tool", "install", "--from", _RDT_GIT_SOURCE, "rdt-cli"]),
+    ]:
+        tool_cmd = shutil.which(tool)
+        if tool_cmd:
             try:
-                subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                               errors="replace", timeout=120)
-                if shutil.which("rdt"):
+                result = subprocess.run(
+                    [tool_cmd, *args], capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                )
+                if result.returncode == 0 and shutil.which("rdt"):
                     print("  ✅ rdt-cli installed")
-                    return
-            except Exception:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
                 pass
-    print("  [!]  rdt-cli install failed. Run: pipx install rdt-cli")
+    print(f"  [!]  rdt-cli install failed. Run: pipx install '{_RDT_GIT_SOURCE}'")
+    return False
 
 
 def _install_bili_deps():
@@ -728,136 +1122,25 @@ def _install_bili_deps():
     print("Setting up Bilibili (bili-cli)...")
     if shutil.which("bili"):
         print("  ✅ bili-cli already installed")
-        return
-    for tool, cmd in [("pipx", ["pipx", "install", "bilibili-cli"]),
-                      ("uv", ["uv", "tool", "install", "bilibili-cli"])]:
-        if shutil.which(tool):
+        return True
+    for tool, args in [
+        ("pipx", ["install", "bilibili-cli"]),
+        ("uv", ["tool", "install", "bilibili-cli"]),
+    ]:
+        tool_cmd = shutil.which(tool)
+        if tool_cmd:
             try:
-                subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                               errors="replace", timeout=120)
-                if shutil.which("bili"):
+                result = subprocess.run(
+                    [tool_cmd, *args], capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                )
+                if result.returncode == 0 and shutil.which("bili"):
                     print("  ✅ bili-cli installed")
-                    return
-            except Exception:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
                 pass
     print("  [!]  bili-cli install failed. Run: pipx install bilibili-cli")
-
-
-def _install_weibo_deps():
-    """Install Weibo MCP server (Panniantong fork with visitor passport auth)."""
-    import shutil
-    import subprocess
-
-    print("Setting up Weibo MCP server...")
-
-    # Check if already installed and working
-    mcporter = shutil.which("mcporter")
-    if mcporter:
-        try:
-            r = subprocess.run(
-                [mcporter, "config", "list"], capture_output=True,
-                encoding="utf-8", errors="replace", timeout=5
-            )
-            if "weibo" in r.stdout:
-                print("  ✅ Weibo MCP already configured")
-                return
-        except Exception:
-            pass
-
-    # Install from our fork (has visitor passport auth fix)
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q",
-             "git+https://github.com/Panniantong/mcp-server-weibo.git"],
-            check=True, timeout=120
-        )
-        print("  ✅ mcp-server-weibo installed (Panniantong fork)")
-    except Exception as e:
-        print(f"  [!]  mcp-server-weibo install failed: {e}")
-        return
-
-    # Register with mcporter
-    if mcporter:
-        try:
-            subprocess.run(
-                [mcporter, "config", "add", "weibo", "--command", "mcp-server-weibo"],
-                check=True, capture_output=True, timeout=10
-            )
-            print("  ✅ Weibo MCP registered with mcporter")
-        except Exception:
-            print("  [!]  mcporter config add failed. Run manually: mcporter config add weibo --command 'mcp-server-weibo'")
-    else:
-        print("  -- mcporter not found, skipping MCP registration. Install mcporter first, then run: mcporter config add weibo --command 'mcp-server-weibo'")
-
-
-def _install_wechat_deps():
-    """Install WeChat article reading and search dependencies."""
-    import subprocess
-
-    print("Setting up WeChat article tools...")
-
-    # Check if already installed
-    has_camoufox = False
-    has_miku = False
-    try:
-        import camoufox  # noqa: F401
-        has_camoufox = True
-    except ImportError:
-        pass
-    try:
-        import miku_ai  # noqa: F401
-        has_miku = True
-    except ImportError:
-        pass
-
-    # Install Python packages
-    if has_camoufox and has_miku:
-        print("  ✅ WeChat Python packages already installed")
-    else:
-        pkgs = []
-        if not has_camoufox:
-            pkgs.extend(["camoufox[geoip]", "markdownify", "beautifulsoup4", "httpx"])
-        if not has_miku:
-            pkgs.append("miku_ai")
-        try:
-            cmd = [sys.executable, "-m", "pip", "install", "--break-system-packages", "-q"] + pkgs
-            subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
-            # Verify
-            ok = True
-            try:
-                import importlib
-                if not has_camoufox:
-                    importlib.import_module("camoufox")
-                if not has_miku:
-                    importlib.import_module("miku_ai")
-            except ImportError:
-                ok = False
-            if ok:
-                print(f"  ✅ WeChat Python packages installed ({', '.join(pkgs)})")
-            else:
-                print(f"  [!]  Some WeChat packages failed to install. Try: pip install {' '.join(pkgs)}")
-        except Exception:
-            print(f"  [!]  WeChat packages install failed. Try: pip install {' '.join(pkgs)}")
-
-    # Clone wechat-article-for-ai tool
-    tools_dir = os.path.expanduser("~/.agent-reach/tools")
-    wechat_dir = os.path.join(tools_dir, "wechat-article-for-ai")
-    if os.path.isfile(os.path.join(wechat_dir, "main.py")):
-        print("  ✅ wechat-article-for-ai tool already installed")
-    else:
-        try:
-            os.makedirs(tools_dir, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", "--depth", "1",
-                 "https://github.com/Panniantong/wechat-article-for-ai.git", wechat_dir],
-                capture_output=True, encoding="utf-8", errors="replace", timeout=60,
-            )
-            if os.path.isfile(os.path.join(wechat_dir, "main.py")):
-                print("  ✅ wechat-article-for-ai tool installed")
-            else:
-                print("  [!]  wechat-article-for-ai clone failed. Try: git clone https://github.com/Panniantong/wechat-article-for-ai.git " + wechat_dir)
-        except Exception:
-            print("  [!]  wechat-article-for-ai clone failed. Try: git clone https://github.com/Panniantong/wechat-article-for-ai.git " + wechat_dir)
+    return False
 
 
 def _install_system_deps_safe():
@@ -873,7 +1156,7 @@ def _install_system_deps_safe():
 
     missing = []
     for name, binaries, label, install_hint in deps:
-        found = any(shutil.which(b) for b in binaries)
+        found = all(shutil.which(b) for b in binaries)
         if found:
             print(f"  ✅ {label} already installed")
         else:
@@ -896,12 +1179,16 @@ def _install_system_deps_dryrun():
     print("[dry-run] System dependency check:")
 
     checks = [
-        ("gh CLI", ["gh"], "apt install gh / brew install gh"),
-        ("Node.js", ["node"], "curl NodeSource setup | bash + apt install nodejs"),
+        ("gh CLI", ["gh"], "apt-get install gh / brew install gh"),
+        (
+            "Node.js",
+            ["node", "npm"],
+            "apt-get install nodejs npm / brew install node",
+        ),
     ]
 
     for label, binaries, method in checks:
-        found = any(shutil.which(b) for b in binaries)
+        found = all(shutil.which(b) for b in binaries)
         if found:
             print(f"  ✅ {label}: already installed, skip")
         else:
@@ -916,43 +1203,75 @@ def _install_mcporter():
 
     print("Setting up mcporter (search backend)...")
 
-    if shutil.which("mcporter"):
+    mcporter_cmd = shutil.which("mcporter")
+    if mcporter_cmd:
         print("  ✅ mcporter already installed")
     else:
-        # Check for npm/npx
-        if not shutil.which("npm") and not shutil.which("npx"):
+        npm_cmd = shutil.which("npm")
+        if not npm_cmd:
             print("  [!]  mcporter requires Node.js. Install Node.js first:")
-            print("     https://nodejs.org/ or: curl -fsSL https://fnm.vercel.app/install | bash")
-            return
+            print("     https://nodejs.org/")
+            return False
         try:
-            subprocess.run(
-                ["npm", "install", "-g", "mcporter"],
+            install_result = subprocess.run(
+                [npm_cmd, "install", "-g", "mcporter"],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=120,
             )
-            if shutil.which("mcporter"):
+            mcporter_cmd = shutil.which("mcporter")
+            if install_result.returncode == 0 and mcporter_cmd:
                 print("  ✅ mcporter installed")
             else:
                 print("  [X] mcporter install failed. Retry: npm install -g mcporter (check network/timeout), or try: npx mcporter@latest list")
-                return
-        except Exception as e:
+                return False
+        except (OSError, subprocess.TimeoutExpired) as e:
             print(f"  [X] mcporter install failed: {e}")
-            return
+            return False
 
     # Configure Exa MCP (free, no key needed)
     try:
-        r = subprocess.run(
-            ["mcporter", "config", "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=5
+        from agent_reach.channels.mcporter import (
+            McporterConfigError,
+            configured_server_names,
         )
-        if "exa" not in r.stdout:
-            subprocess.run(
-                ["mcporter", "config", "add", "exa", "https://mcp.exa.ai/mcp"],
+
+        r = subprocess.run(
+            [mcporter_cmd, "config", "list", "--json"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if r.returncode != 0:
+            raise McporterConfigError("mcporter 配置查询失败")
+        server_names = configured_server_names(r.stdout)
+        if "exa" not in server_names:
+            add_result = subprocess.run(
+                [
+                    mcporter_cmd,
+                    "config",
+                    "add",
+                    "exa",
+                    "https://mcp.exa.ai/mcp",
+                    "--scope",
+                    "home",
+                ],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=10,
             )
-            print("  ✅ Exa search configured (free, no API key needed)")
+            if add_result.returncode == 0:
+                print("  ✅ Exa search configured (free, no API key needed)")
+                return True
+            else:
+                print(
+                    "  [!]  Could not configure Exa. Run manually: "
+                    "mcporter config add exa https://mcp.exa.ai/mcp --scope home"
+                )
+                return False
         else:
             print("  ✅ Exa search already configured")
+            return True
     except Exception:
-        print("  [!]  Could not configure Exa. Run manually: mcporter config add exa https://mcp.exa.ai/mcp")
+        print("  [!]  Could not configure Exa. Run manually: mcporter config add exa https://mcp.exa.ai/mcp --scope home")
+        return False
 
     # NOTE: xhs-cli is now optional, installed via --channels=xiaohongshu
 
@@ -965,11 +1284,11 @@ def _install_mcporter_safe():
 
     if shutil.which("mcporter"):
         print("  ✅ mcporter already installed")
-        print("  To configure Exa search: mcporter config add exa https://mcp.exa.ai/mcp")
+        print("  To configure Exa search: mcporter config add exa https://mcp.exa.ai/mcp --scope home")
     else:
         print("  -- mcporter not installed")
         print("  To install: npm install -g mcporter")
-        print("  Then configure Exa: mcporter config add exa https://mcp.exa.ai/mcp")
+        print("  Then configure Exa: mcporter config add exa https://mcp.exa.ai/mcp --scope home")
 
 
 def _detect_environment():
@@ -1014,9 +1333,51 @@ def _detect_environment():
     return "server" if indicators >= 2 else "local"
 
 
+def _read_configure_value(args) -> str:
+    """Read one configure value without echoing secrets by default."""
+    values = getattr(args, "value", None) or []
+    if getattr(args, "read_stdin", False):
+        try:
+            value = sys.stdin.read(_MAX_CONFIGURE_VALUE_CHARS + 1)
+        except OSError:
+            print("Could not read configure value from stdin", file=sys.stderr)
+            raise SystemExit(1) from None
+        if len(value) > _MAX_CONFIGURE_VALUE_CHARS:
+            print("Configure value exceeds the 1 MiB safety limit", file=sys.stderr)
+            raise SystemExit(1)
+        return value.rstrip("\r\n")
+
+    if values:
+        if getattr(args, "key", None) in _SENSITIVE_CONFIG_KEYS:
+            print(
+                "Warning: positional secrets are deprecated because shell history "
+                "and process listings may expose them; omit the value for a hidden "
+                "prompt or use --stdin.",
+                file=sys.stderr,
+            )
+        return " ".join(values)
+
+    try:
+        interactive = bool(sys.stdin.isatty())
+    except (AttributeError, OSError):
+        interactive = False
+    if not interactive:
+        return ""
+
+    import getpass
+
+    try:
+        return getpass.getpass(f"Value for {args.key}: ")
+    except (EOFError, KeyboardInterrupt):
+        print("Configure input cancelled", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 def _cmd_configure(args):
     """Set a config value and test it, or auto-extract from browser."""
     import shutil
+    from typing import cast
+
     from agent_reach.config import Config
 
     config = Config()
@@ -1026,41 +1387,78 @@ def _cmd_configure(args):
         from agent_reach.cookie_extract import configure_from_browser
 
         browser = args.from_browser
-        print(f"Extracting cookies from {browser}...")
+        platform = "xhs" if args.platform == "xiaohongshu" else args.platform
+        print(f"Extracting {args.platform} cookies from {browser}...")
         print()
 
-        results = configure_from_browser(browser, config)
+        try:
+            results = configure_from_browser(
+                browser,
+                config,
+                platform=platform,
+                profile=args.profile,
+            )
+        except ValueError as exc:
+            from agent_reach.utils.text import scrub_url_credentials
+
+            print(
+                f"agent-reach configure: error: "
+                f"{scrub_url_credentials(exc)}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from None
 
         found_any = False
-        for platform, success, message in results:
+        for result in results:
+            if hasattr(result, "platform"):
+                result_platform = result.platform
+                success = result.success
+                message = result.message
+                targets = getattr(result, "targets", ())
+            else:
+                legacy_result = cast(tuple[str, bool, str], result)
+                result_platform, success, message = legacy_result
+                targets = ()
             if success:
-                print(f"  ✅ {platform}: {message}")
+                print(f"  ✅ {result_platform}: {message}")
+                if targets:
+                    print(f"     写入：{', '.join(targets)}")
                 found_any = True
             else:
-                print(f"  -- {platform}: {message}")
+                print(f"  -- {result_platform}: {message}")
 
         print()
         if found_any:
             print("✅ Cookies configured! Run `agent-reach doctor` to see updated status.")
         else:
             print(f"No cookies found. Make sure you're logged into the platforms in {browser}.")
+            raise SystemExit(1)
         return
 
     # ── Manual configure ──
     if not args.key:
-        print("Usage: agent-reach configure <key> <value>")
-        print("   or: agent-reach configure --from-browser chrome")
+        print("Usage: agent-reach configure <key> [--stdin]")
+        print("   Omit the value to enter it through a hidden prompt.")
+        print(
+            "   or: agent-reach configure --from-browser chrome "
+            "--platform xueqiu"
+        )
         return
 
-    value = " ".join(args.value) if args.value else ""
+    value = _read_configure_value(args)
     if not value:
         print(f"Missing value for {args.key}")
-        return
+        raise SystemExit(1)
 
     if args.key == "proxy":
+        # Generic network proxy for restricted environments. Nothing reads
+        # this key at runtime — agents read it back and export HTTP(S)_PROXY
+        # before invoking upstream tools (see docs/install.md). The legacy
+        # bilibili_proxy key is kept in sync for older configs.
+        config.set("proxy", value)
         config.set("bilibili_proxy", value)
-        print(f"✅ Proxy configured for Bilibili!")
-        print("  Note: Reddit 已改为通过 rdt-cli 访问，无需代理。")
+        print("✅ 代理已保存（供 Agent 在访问 Reddit/Twitter 等需要代理的网络时设置 HTTP_PROXY/HTTPS_PROXY）")
+        print("  Note: B站走 bili-cli，国内网络无需代理。")
 
     elif args.key == "twitter-cookies":
         # Accept two formats:
@@ -1072,37 +1470,49 @@ def _cmd_configure(args):
             config.set("twitter_auth_token", auth_token)
             config.set("twitter_ct0", ct0)
 
-            # Sync credentials to twitter-cli env
-            print("✅ Twitter cookies configured!")
+            print("✅ Twitter cookies 已保存到 ~/.agent-reach/config.yaml")
+            if getattr(args, "sync_legacy_twitter", False):
+                from agent_reach.cookie_extract import (
+                    _sync_bird_env,
+                    _sync_xfetch_session,
+                )
 
-            print("Testing Twitter access...", end=" ")
-            try:
-                import subprocess
-                twitter_bin = shutil.which("twitter")
-                if not twitter_bin:
-                    print("[!] twitter-cli not installed. Run: pipx install twitter-cli")
-                else:
-                    import os
-                    env = os.environ.copy()
-                    env["TWITTER_AUTH_TOKEN"] = auth_token
-                    env["TWITTER_CT0"] = ct0
-                    result = subprocess.run(
-                        [twitter_bin, "status"],
-                        capture_output=True, encoding="utf-8", errors="replace", timeout=15,
-                        env=env,
-                    )
-                    output = (result.stdout or "") + (result.stderr or "")
-                    if "ok: true" in output:
-                        print("✅ Twitter access works!")
-                    else:
-                        print("[!] Auth check failed (cookies might be wrong)")
-            except Exception as e:
-                print(f"[X] Failed: {e}")
+                legacy_results = (
+                    (
+                        "~/.config/xfetch/session.json",
+                        _sync_xfetch_session(auth_token, ct0),
+                    ),
+                    (
+                        "~/.config/bird/credentials.env",
+                        _sync_bird_env(auth_token, ct0),
+                    ),
+                )
+                for path, success in legacy_results:
+                    outcome = "written" if success else "failed"
+                    print(f"  {outcome}: {path}")
+                if all(success for _, success in legacy_results):
+                    print("  Legacy copies written successfully.")
+
+            print(
+                "  凭据未实时验证：不会执行 `twitter status`，因为上游在"
+                "验证失败时会自动读取浏览器 Cookie。"
+            )
+            if not shutil.which("twitter"):
+                print(
+                    "  [!] twitter-cli 未安装。运行：pipx install twitter-cli"
+                )
+            else:
+                print(
+                    "  注意：独立 `twitter` 命令不会读取 Agent Reach 配置；"
+                    "直接使用时需显式设置 TWITTER_AUTH_TOKEN/TWITTER_CT0。"
+                )
         else:
             print("[X] Could not find auth_token and ct0 in your input.")
-            print("   Accepted formats:")
-            print("   1. agent-reach configure twitter-cookies AUTH_TOKEN CT0")
-            print('   2. agent-reach configure twitter-cookies "auth_token=xxx; ct0=yyy; ..."')
+            print("   Run `agent-reach configure twitter-cookies` and paste either:")
+            print("   1. AUTH_TOKEN and CT0 separated by whitespace")
+            print("   2. A Cookie-Editor Header String")
+            print("   For automation, pass the same value through --stdin.")
+            raise SystemExit(1)
 
     elif args.key == "youtube-cookies":
         config.set("youtube_cookies_from", value)
@@ -1110,15 +1520,48 @@ def _cmd_configure(args):
         print("   yt-dlp will use cookies from this browser for age-restricted/member videos.")
 
     elif args.key == "xhs-cookies":
-        _configure_xhs_cookies(value)
+        if not _configure_xhs_cookies(value):
+            raise SystemExit(1)
 
     elif args.key == "github-token":
         config.set("github_token", value)
-        print(f"✅ GitHub token configured!")
+        print("✅ GitHub token configured!")
 
     elif args.key == "groq-key":
         config.set("groq_api_key", value)
-        print(f"✅ Groq key configured!")
+        print("✅ Groq key configured!")
+
+    elif args.key == "openai-key":
+        config.set("openai_api_key", value)
+        print("✅ OpenAI key configured!")
+
+
+def _cmd_transcribe(args):
+    """Transcribe a URL or local audio file via an explicitly selected provider."""
+    from pathlib import Path
+
+    from agent_reach.transcribe import TranscribeError, transcribe
+    from agent_reach.utils.text import scrub_url_credentials
+
+    try:
+        text = transcribe(
+            args.source,
+            provider=args.provider,
+            allow_provider_fallback=getattr(
+                args,
+                "allow_provider_fallback",
+                False,
+            ),
+        )
+    except TranscribeError as e:
+        print(f"❌ {scrub_url_credentials(e)}")
+        sys.exit(1)
+
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+        print(f"✅ Transcript written to {args.output}")
+    else:
+        print(text)
 
 
 def _parse_twitter_cookie_input(value: str):
@@ -1142,7 +1585,7 @@ def _parse_twitter_cookie_input(value: str):
     return auth_token, ct0
 
 
-def _configure_xhs_cookies(value):
+def _configure_xhs_cookies(value) -> bool:
     """Import cookies into xiaohongshu-mcp Docker container.
 
     Accepts two formats:
@@ -1154,14 +1597,16 @@ def _configure_xhs_cookies(value):
     Format: JSON array of {name, value, domain, path, expires, httpOnly, secure, sameSite}.
     """
     import json
+    import os
     import shutil
     import subprocess
 
     value = value.strip()
     if not value:
         print("[X] Missing cookie value.")
-        print("   Usage: agent-reach configure xhs-cookies '<cookie JSON or header string>'")
-        return
+        print("   Run `agent-reach configure xhs-cookies` and paste the Cookie-Editor export.")
+        print("   For automation, pass the same value through --stdin.")
+        return False
 
     # Detect format and parse
     cookies_json = None
@@ -1171,20 +1616,54 @@ def _configure_xhs_cookies(value):
         try:
             parsed = json.loads(value)
             if isinstance(parsed, list) and parsed:
-                # Validate it looks like cookie objects
-                first = parsed[0]
-                if isinstance(first, dict) and "name" in first and "value" in first:
-                    cookies_json = json.dumps(parsed)
-                    print(f"  Parsed {len(parsed)} cookies from JSON format")
-                else:
-                    print("[X] JSON array doesn't contain cookie objects (need name/value fields)")
-                    return
+                from agent_reach.utils.url import domain_matches
+
+                valid_cookies = []
+                ignored_domains = 0
+                ignored_invalid = 0
+                for cookie in parsed:
+                    if (
+                        not isinstance(cookie, dict)
+                        or not isinstance(cookie.get("name"), str)
+                        or not cookie["name"]
+                        or not isinstance(cookie.get("value"), str)
+                    ):
+                        ignored_invalid += 1
+                        continue
+                    if not domain_matches(
+                        cookie.get("domain", ""),
+                        "xiaohongshu.com",
+                    ):
+                        ignored_domains += 1
+                        continue
+                    valid_cookies.append(cookie)
+
+                if ignored_domains:
+                    print(
+                        f"  [!] 已忽略 {ignored_domains} 个非 "
+                        "xiaohongshu.com 域 Cookie"
+                    )
+                if ignored_invalid:
+                    print(
+                        f"  [!] 已忽略 {ignored_invalid} 个格式无效的 Cookie"
+                    )
+                if not valid_cookies:
+                    print(
+                        "[X] Cookie-Editor JSON 中没有有效的 "
+                        "xiaohongshu.com 域 Cookie"
+                    )
+                    return False
+                cookies_json = json.dumps(valid_cookies)
+                print(
+                    f"  Parsed {len(valid_cookies)} "
+                    "xiaohongshu.com cookies from JSON format"
+                )
             else:
                 print("[X] Empty or invalid JSON array")
-                return
+                return False
         except json.JSONDecodeError as e:
             print(f"[X] Invalid JSON: {e}")
-            return
+            return False
 
     # Header String format: "key1=val1; key2=val2; ..."
     if cookies_json is None and "=" in value:
@@ -1214,26 +1693,34 @@ def _configure_xhs_cookies(value):
             print(f"  Parsed {len(cookies)} cookies from Header String format")
         else:
             print("[X] Could not parse any cookies from input")
-            return
+            return False
 
     if not cookies_json:
         print("[X] Could not parse cookies. Accepted formats:")
         print('   1. JSON array: \'[{"name":"x","value":"y","domain":".xiaohongshu.com",...}]\'')
         print('   2. Header String: "key1=val1; key2=val2; ..."')
-        return
+        return False
 
     # Find the container
     docker = shutil.which("docker")
     if not docker:
-        # No Docker - write to a local file for manual import
-        cookie_path = os.path.expanduser("~/.agent-reach/xhs-cookies.json")
-        with open(cookie_path, "w") as f:
-            f.write(cookies_json)
-        os.chmod(cookie_path, 0o600)
+        # No Docker - write to a local file for manual import.
+        from agent_reach.utils.paths import (
+            PrivatePathError,
+            atomic_write_private_text,
+            home_dir,
+        )
+
+        cookie_path = home_dir() / ".agent-reach" / "xhs-cookies.json"
+        try:
+            atomic_write_private_text(cookie_path, cookies_json)
+        except (OSError, PrivatePathError) as exc:
+            print(f"[X] Could not save cookies safely: {exc}")
+            return False
         print(f"  Cookies saved to {cookie_path}")
         print("  Docker not found. Copy manually:")
         print(f"  docker cp {cookie_path} xiaohongshu-mcp:/app/data/cookies.json")
-        return
+        return True
 
     # Check if xiaohongshu-mcp container is running
     try:
@@ -1246,10 +1733,10 @@ def _configure_xhs_cookies(value):
             print("[X] xiaohongshu-mcp container is not running.")
             print("   Start it first:")
             print("   docker run -d --name xiaohongshu-mcp -p 18060:18060 xpzouying/xiaohongshu-mcp")
-            return
+            return False
     except Exception as e:
         print(f"[X] Could not check Docker: {e}")
-        return
+        return False
 
     # Find the cookies path inside the container
     try:
@@ -1264,6 +1751,7 @@ def _configure_xhs_cookies(value):
         cookie_path_in_container = "/app/cookies.json"
 
     # Write cookies into the container
+    tmp_path = None
     try:
         # Write to temp file then docker cp
         import tempfile
@@ -1275,27 +1763,43 @@ def _configure_xhs_cookies(value):
             [docker, "cp", tmp_path, f"{container_name}:{cookie_path_in_container}"],
             capture_output=True, encoding="utf-8", timeout=10,
         )
-        os.unlink(tmp_path)
 
         if result.returncode != 0:
             print(f"[X] Failed to copy cookies: {result.stderr}")
-            return
+            return False
 
         print(f"✅ Cookies written to {container_name}:{cookie_path_in_container}")
         # Restart container so it reloads cookies from disk
         print("  Restarting container to reload cookies...", end=" ", flush=True)
         try:
-            subprocess.run(
+            restart = subprocess.run(
                 [docker, "restart", container_name],
                 capture_output=True, encoding="utf-8", timeout=30,
             )
+            if restart.returncode != 0:
+                detail = (
+                    (restart.stderr or "").strip()[:200]
+                    or f"exit {restart.returncode}"
+                )
+                print(f"\n  [!] Could not restart container: {detail}")
+                print(f"  Restart manually: docker restart {container_name}")
+                return False
             print("done")
         except Exception as e:
             print(f"\n  [!] Could not restart container: {e}")
             print(f"  Restart manually: docker restart {container_name}")
+            return False
     except Exception as e:
         print(f"[X] Failed to write cookies: {e}")
-        return
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"  [!] Could not remove temporary cookie file: {e}")
 
     # Verify login status via mcporter
     mcporter = shutil.which("mcporter")
@@ -1316,12 +1820,15 @@ def _configure_xhs_cookies(value):
             print(f"[!] Could not verify: {e}")
     else:
         print("  (mcporter not found, skipping verification)")
+    return True
 
 
 def _cmd_uninstall(args):
     """Remove all Agent Reach config, tokens, and skill files."""
     import shutil
     import subprocess
+
+    from agent_reach.utils.paths import home_dir
 
     dry_run = args.dry_run
     keep_config = args.keep_config
@@ -1335,9 +1842,10 @@ def _cmd_uninstall(args):
         print()
 
     removed_any = False
+    mcporter_cleanup_skipped = False
 
     # ── 1. Config directory (~/.agent-reach/) ──
-    config_dir = os.path.expanduser("~/.agent-reach")
+    config_dir = home_dir() / ".agent-reach"
     if not keep_config:
         if os.path.isdir(config_dir):
             if dry_run:
@@ -1355,8 +1863,25 @@ def _cmd_uninstall(args):
     else:
         print(f"  Skipping config directory (--keep-config): {config_dir}")
 
+    # Opt-in legacy copies may be shared with upstream tools. Without a
+    # provenance marker it would be unsafe to delete them automatically, so
+    # surface every exact path that may still contain Twitter credentials.
+    legacy_credential_paths = (
+        home_dir() / ".config" / "xfetch" / "session.json",
+        home_dir() / ".config" / "bird" / "credentials.env",
+    )
+    present_legacy_paths = [
+        path for path in legacy_credential_paths if os.path.lexists(path)
+    ]
+    if present_legacy_paths:
+        print("  [!] 检测到可选的 Twitter legacy 凭据副本；不会自动删除：")
+        for path in present_legacy_paths:
+            print(f"      {path}")
+        print("      若确认不再被 xfetch/bird 使用，请手动删除。")
+
     # ── 2. Skill files ──
     skill_dirs = [
+        ("~/.config/opencode/skills/agent-reach", "OpenCode"),
         ("~/.openclaw/skills/agent-reach", "OpenClaw"),
         ("~/.claude/skills/agent-reach", "Claude Code"),
         ("~/.agents/skills/agent-reach", "Agent"),
@@ -1369,7 +1894,10 @@ def _cmd_uninstall(args):
                 print(f"[dry-run] Would remove {platform_name} skill: {skill_path}")
             else:
                 try:
-                    shutil.rmtree(skill_path)
+                    if os.path.islink(skill_path):
+                        os.unlink(skill_path)
+                    else:
+                        shutil.rmtree(skill_path)
                     print(f"  Removed {platform_name} skill: {skill_path}")
                     removed_any = True
                 except Exception as e:
@@ -1377,23 +1905,46 @@ def _cmd_uninstall(args):
 
     # ── 3. mcporter MCP entries ──
     if shutil.which("mcporter"):
-        for mcp_name in ("exa", "xiaohongshu"):
-            try:
-                r = subprocess.run(
-                    ["mcporter", "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=10
+        from agent_reach.channels.mcporter import (
+            McporterConfigError,
+            configured_server_names,
+        )
+
+        try:
+            result = subprocess.run(
+                [
+                    "mcporter",
+                    "config",
+                    "list",
+                    "--json",
+                ],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if result.returncode != 0:
+                raise McporterConfigError("mcporter config query failed")
+            server_names = configured_server_names(result.stdout)
+        except (
+            McporterConfigError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ):
+            mcporter_cleanup_skipped = True
+            print(
+                "  [!] 无法安全核验 mcporter 配置来源；"
+                "不会自动删除 exa/xiaohongshu 项。"
+            )
+        else:
+            for mcp_name in ("exa", "xiaohongshu"):
+                if mcp_name not in server_names:
+                    continue
+                mcporter_cleanup_skipped = True
+                print(
+                    f"  [!] mcporter entry {mcp_name} 来源无法证明由 "
+                    "Agent Reach 管理；已保留。若确认不再需要，请手动移除。"
                 )
-                if mcp_name in r.stdout:
-                    if dry_run:
-                        print(f"[dry-run] Would remove mcporter entry: {mcp_name}")
-                    else:
-                        subprocess.run(
-                            ["mcporter", "config", "remove", mcp_name],
-                            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
-                        )
-                        print(f"  Removed mcporter entry: {mcp_name}")
-                        removed_any = True
-            except Exception:
-                pass
 
     # ── 4. Summary and optional steps ──
     print()
@@ -1403,6 +1954,8 @@ def _cmd_uninstall(args):
     else:
         if removed_any:
             print("Agent Reach data removed.")
+        elif mcporter_cleanup_skipped:
+            print("No proven Agent Reach-managed mcporter data was removed.")
         else:
             print("Nothing to remove — already clean.")
 
@@ -1416,22 +1969,28 @@ def _cmd_uninstall(args):
     print("  npm uninstall -g undici")
 
 
-def _cmd_doctor():
+def _cmd_doctor(args=None):
     from agent_reach.config import Config
     from agent_reach.doctor import check_all, format_report
-    try:
-        from rich import print as rprint
-    except ImportError:
-        rprint = print
-    config = Config()
+    config = Config(read_only=True)
     results = check_all(config)
-    rprint(format_report(results))
 
-    # Auto-install skill if not already present (fixes #154)
-    _install_skill()
+    if args is not None and getattr(args, "json", False):
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+
+    report = format_report(results)
+    try:
+        from rich import print as rich_print
+    except ImportError:
+        print(report)
+    else:
+        rich_print(report)
 
 
 def _cmd_setup():
+    import getpass
+
     from agent_reach.config import Config
 
     config = Config()
@@ -1450,31 +2009,50 @@ def _cmd_setup():
     if not shutil.which("mcporter"):
         print("  当前状态: -- mcporter 未安装")
         print("  安装：npm install -g mcporter")
-        print("  然后：mcporter config add exa https://mcp.exa.ai/mcp")
+        print("  然后：mcporter config add exa https://mcp.exa.ai/mcp --scope home")
         print()
     else:
         try:
-            r = subprocess.run(
-                ["mcporter", "config", "list"], capture_output=True, encoding="utf-8", errors="replace", timeout=10
+            from agent_reach.channels.mcporter import (
+                McporterConfigError,
+                configured_server_names,
             )
-            if "exa" in r.stdout.lower():
+
+            r = subprocess.run(
+                ["mcporter", "config", "list", "--json"],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if r.returncode != 0:
+                raise McporterConfigError("mcporter 配置查询失败")
+            if "exa" in configured_server_names(r.stdout):
                 print("  当前状态: ✅ 已配置")
             else:
                 print("  当前状态: -- 未配置")
                 setup_now = input("  现在自动配置 Exa 吗？[Y/n]: ").strip().lower()
                 if setup_now in ("", "y", "yes"):
                     add_r = subprocess.run(
-                        ["mcporter", "config", "add", "exa", "https://mcp.exa.ai/mcp"],
+                        [
+                            "mcporter",
+                            "config",
+                            "add",
+                            "exa",
+                            "https://mcp.exa.ai/mcp",
+                            "--scope",
+                            "home",
+                        ],
                         capture_output=True, encoding="utf-8", errors="replace", timeout=10,
                     )
                     if add_r.returncode == 0:
                         print("  ✅ Exa 已配置")
                     else:
                         print("  [!] 自动配置失败，请手动执行：")
-                        print("     mcporter config add exa https://mcp.exa.ai/mcp")
+                        print("     mcporter config add exa https://mcp.exa.ai/mcp --scope home")
         except Exception:
             print("  [!] 无法检查 Exa 配置，请手动执行：")
-            print("     mcporter config add exa https://mcp.exa.ai/mcp")
+            print("     mcporter config add exa https://mcp.exa.ai/mcp --scope home")
         print()
 
     # Step 2: GitHub token
@@ -1483,9 +2061,9 @@ def _cmd_setup():
     print("  获取: https://github.com/settings/tokens (无需任何权限)")
     current = config.get("github_token")
     if current:
-        print(f"  当前状态: ✅ 已配置")
+        print("  当前状态: ✅ 已配置")
     else:
-        key = input("  GITHUB_TOKEN (回车跳过): ").strip()
+        key = getpass.getpass("  GITHUB_TOKEN (回车跳过): ").strip()
         if key:
             config.set("github_token", key)
             print("  ✅ GitHub API 已提升至 5000 次/小时！")
@@ -1494,8 +2072,9 @@ def _cmd_setup():
     print()
 
     # Step 3: Reddit — rdt-cli
-    print("【信息】Reddit — 通过 rdt-cli 搜索和阅读，无需配置")
-    print("  安装：pipx install rdt-cli")
+    print("【信息】Reddit — 必须登录态（无零配置路径）。桌面推荐 OpenCLI；或 rdt-cli：")
+    print(f"  安装：pipx install '{_RDT_GIT_SOURCE}'")
+    print("  然后运行：rdt login（需先在浏览器登录 reddit.com）")
     print()
 
     # Step 4: Groq (Whisper)
@@ -1503,9 +2082,9 @@ def _cmd_setup():
     print("  免费额度，注册: https://console.groq.com")
     current = config.get("groq_api_key")
     if current:
-        print(f"  当前状态: ✅ 已配置")
+        print("  当前状态: ✅ 已配置")
     else:
-        key = input("  GROQ_API_KEY (回车跳过): ").strip()
+        key = getpass.getpass("  GROQ_API_KEY (回车跳过): ").strip()
         if key:
             config.set("groq_api_key", key)
             print("  ✅ 语音转文字已开启！")
@@ -1611,6 +2190,35 @@ def _github_get_with_retry(url, timeout=10, retries=3, sleeper=time.sleep):
     return None, "unknown", retries
 
 
+#: Full update = package + upstream tools + skill. The one-liner walks an
+#: agent through all three (docs/update.md); bare pip only updates the package.
+_UPDATE_INSTRUCTIONS = (
+    "更新方式（推荐，复制这句话给你的 AI Agent，会完整更新本体+上游工具+skill）：\n"
+    "  帮我更新 Agent Reach：https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/update.md\n"
+    "仅更新本体（不含上游工具和 skill）：\n"
+    "  pip install --upgrade https://github.com/Panniantong/agent-reach/archive/main.zip"
+)
+
+
+def _is_newer_version(remote: str, local: str) -> bool:
+    """True if remote is strictly newer than local (semantic compare).
+
+    A plain != would tell users "update available" when their local build is
+    AHEAD of the latest release (e.g. installed from main during a release
+    window) — and walk them into a downgrade.
+    """
+    def parse(v):
+        try:
+            return tuple(int(x) for x in v.strip().split("."))
+        except ValueError:
+            return None
+
+    remote_version, local_version = parse(remote), parse(local)
+    if remote_version is None or local_version is None:
+        return remote != local  # unparseable — fall back to old behavior
+    return remote_version > local_version
+
+
 def _cmd_check_update():
     """Check for newer versions on GitHub."""
     from agent_reach import __version__
@@ -1630,7 +2238,7 @@ def _cmd_check_update():
         latest = data.get("tag_name", "").lstrip("v")
         body = data.get("body", "")
 
-        if latest and latest != __version__:
+        if latest and _is_newer_version(latest, __version__):
             print(f"最新版本: v{latest} ← 有更新！")
             if body:
                 print()
@@ -1639,10 +2247,9 @@ def _cmd_check_update():
                 for line in body.strip().split("\n")[:20]:
                     print(f"  {line}")
             print()
-            print("更新命令:")
-            print("  pip install --upgrade https://github.com/Panniantong/agent-reach/archive/main.zip")
+            print(_UPDATE_INSTRUCTIONS)
             return "update_available"
-        print(f"✅ 已是最新版本")
+        print("✅ 已是最新版本")
         return "up_to_date"
 
     release_err = _classify_github_response_error(resp)
@@ -1662,8 +2269,7 @@ def _cmd_check_update():
         date = commit.get("commit", {}).get("committer", {}).get("date", "")[:10]
         print(f"最新提交: {sha} ({date}) {msg}")
         print()
-        print("更新命令:")
-        print("  pip install --upgrade https://github.com/Panniantong/agent-reach/archive/main.zip")
+        print(_UPDATE_INSTRUCTIONS)
         return "unknown"
 
     commit_err = _classify_github_response_error(resp2)
@@ -1680,11 +2286,11 @@ def _cmd_watch():
 
     Only outputs problems. If everything is fine, outputs a single line.
     """
+    from agent_reach import __version__
     from agent_reach.config import Config
     from agent_reach.doctor import check_all
-    from agent_reach import __version__
 
-    config = Config()
+    config = Config(read_only=True)
     issues = []
 
     # Check channels
@@ -1711,7 +2317,7 @@ def _cmd_watch():
     if not err and resp and resp.status_code == 200:
         data = resp.json()
         latest = data.get("tag_name", "").lstrip("v")
-        if latest and latest != __version__:
+        if latest and _is_newer_version(latest, __version__):
             update_available = True
             new_version = latest
             release_body = data.get("body", "")
@@ -1721,8 +2327,8 @@ def _cmd_watch():
         print(f"Agent Reach: 全部正常 ({ok}/{total} 渠道可用，v{__version__} 已是最新)")
         return
 
-    print(f"Agent Reach 监控报告")
-    print(f"=" * 40)
+    print("Agent Reach 监控报告")
+    print("=" * 40)
     print(f"版本: v{__version__}  |  渠道: {ok}/{total}")
 
     if issues:
@@ -1736,7 +2342,8 @@ def _cmd_watch():
         if release_body:
             for line in release_body.strip().split("\n")[:10]:
                 print(f"    {line}")
-        print(f"  更新: pip install --upgrade https://github.com/Panniantong/agent-reach/archive/main.zip")
+        print("  更新（一句话发给 Agent 即可完整更新）：")
+        print("    帮我更新 Agent Reach：https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/update.md")
 
 
 if __name__ == "__main__":

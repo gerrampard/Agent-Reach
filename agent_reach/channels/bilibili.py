@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Bilibili — video via yt-dlp, search/browse via bili-cli or API."""
+"""Bilibili — multi-backend: bili-cli / OpenCLI / search API.
+
+yt-dlp was REMOVED from this channel (live-verified 2026-06): bilibili's
+risk control 412-blocks yt-dlp's requests in every configuration we
+tried — latest version, direct, proxied, with warmed cookies — while
+bili-cli keeps working (search/hot/video detail without login) and
+OpenCLI covers subtitles through the browser session. yt-dlp remains the
+YouTube backend; it just no longer serves bilibili.
+"""
 
 import json
-import os
-import shutil
-import subprocess
 import urllib.request
+
+from agent_reach.probe import probe_command
+
 from .base import Channel
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -27,40 +35,85 @@ def _search_api_ok() -> bool:
 class BilibiliChannel(Channel):
     name = "bilibili"
     description = "B站视频、字幕和搜索"
-    backends = ["yt-dlp", "bili-cli (可选)", "B站搜索 API"]
+    backends = ["bili-cli", "OpenCLI", "B站搜索 API"]
     tier = 1
 
     def can_handle(self, url: str) -> bool:
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lower()
-        return "bilibili.com" in d or "b23.tv" in d
+        from agent_reach.utils.url import host_matches
+
+        return host_matches(url, "bilibili.com", "b23.tv")
 
     def check(self, config=None):
-        if not shutil.which("yt-dlp"):
-            return "off", "yt-dlp 未安装。安装：pip install yt-dlp"
+        """Probe candidates in order; first fully-usable backend wins."""
+        self.active_backend = None
+        findings = []
 
-        proxy = (config.get("bilibili_proxy") if config else None) or os.environ.get("BILIBILI_PROXY")
-        has_bili_cli = bool(shutil.which("bili"))
-
-        parts = []
-
-        # 视频读取状态
-        if proxy:
-            parts.append("视频读取：yt-dlp（代理已配置）")
-        else:
-            parts.append("视频读取：yt-dlp")
-
-        # bili-cli 增强
-        if has_bili_cli:
-            parts.append("搜索/热门/排行：bili-cli 可用")
-        else:
-            # 检测搜索 API 连通性
-            api_ok = _search_api_ok()
-            if api_ok:
-                parts.append("搜索：B站 API 可用")
+        for backend in self.ordered_backends(config):
+            if backend == "bili-cli":
+                result = self._check_bili_cli()
+            elif backend == "OpenCLI":
+                result = self._check_opencli()
             else:
-                parts.append("搜索：B站 API 不可达")
-            parts.append("提示：安装 bili-cli 可解锁热门/排行/动态：pipx install bilibili-cli")
+                result = self._check_search_api()
+            if result is None:
+                continue
+            findings.append((backend, *result))
 
-        status = "ok" if has_bili_cli or _search_api_ok() else "warn"
-        return status, "。".join(parts)
+        # 有后端断链时，即使别的候选兜底成功也要把处方带出来
+        broken_notes = [m for _, s, m in findings if s == "error"]
+
+        for wanted in ("ok", "warn"):
+            for backend, status, message in findings:
+                if status == wanted:
+                    self.active_backend = backend if status == "ok" else None
+                    if broken_notes:
+                        message += "\n[备选后端异常] " + "；".join(broken_notes)
+                    return status, message
+
+        if findings:
+            return "error", "\n".join(m for _, _, m in findings)
+
+        return "off", (
+            "没有可用的 B站后端（搜索 API 也不可达，可能是网络问题）。推荐：\n"
+            "  pipx install bilibili-cli（搜索/热门/视频详情，无需登录）\n"
+            "  或桌面装 OpenCLI（额外解锁字幕）：agent-reach install --system --channels opencli"
+        )
+
+    def _check_bili_cli(self):
+        """bili-cli candidate. None = not installed."""
+        probe = probe_command("bili", ["--version"], timeout=10, package="bilibili-cli")
+        if probe.status == "missing":
+            return None
+        if probe.status == "broken":
+            return "error", "bili 命令存在但无法执行\n" + probe.hint
+        if not probe.ok:
+            return "warn", f"bili-cli 探测失败（{probe.status}），运行 `bili status` 查看详情"
+        return "ok", (
+            "bili-cli 可用（搜索/热门/排行/视频详情/音频，无需登录；"
+            "字幕需 OpenCLI。上游 2026-03 起停更）"
+        )
+
+    def _check_opencli(self):
+        """OpenCLI candidate. None = not installed."""
+        from agent_reach.backends import opencli_status
+
+        st = opencli_status()
+        if not st.installed:
+            return None
+        if st.broken:
+            return "error", st.hint
+        if st.ready:
+            return "warn", (
+                "OpenCLI 桥接已连接，但 Bilibili 页面、登录态和实际命令"
+                "未实时验证；Doctor 不执行平台命令，因此当前不标记为可用。"
+            )
+        return "warn", st.hint
+
+    def _check_search_api(self):
+        """Zero-dependency search API fallback. None = unreachable."""
+        if not _search_api_ok():
+            return None
+        return "ok", (
+            "B站搜索 API 可达（仅搜索，curl 直连）。"
+            "完整功能建议安装 bili-cli：pipx install bilibili-cli"
+        )

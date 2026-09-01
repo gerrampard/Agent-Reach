@@ -2,8 +2,10 @@
 """Xiaoyuzhou Podcast (小宇宙播客) — transcribe podcasts via Groq Whisper API."""
 
 import os
-import shutil
+
 from agent_reach.config import Config
+from agent_reach.probe import probe_command
+
 from .base import Channel
 
 
@@ -14,17 +16,25 @@ class XiaoyuzhouChannel(Channel):
     tier = 1
 
     def can_handle(self, url: str) -> bool:
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lower()
-        return "xiaoyuzhoufm.com" in d
+        from agent_reach.utils.url import host_matches
+
+        return host_matches(url, "xiaoyuzhoufm.com")
 
     def check(self, config=None):
-        # Check ffmpeg
-        if not shutil.which("ffmpeg"):
+        self.active_backend = None
+
+        # Check ffmpeg — really execute it: a stale pip-installed ffmpeg shim
+        # passes shutil.which() but cannot run
+        probe = probe_command("ffmpeg", ["-version"], timeout=10, package="ffmpeg")
+        if probe.status == "missing":
             return "off", (
                 "需要 ffmpeg（音频转码和切片）。安装：\n"
                 "  Ubuntu/Debian: apt install -y ffmpeg\n"
                 "  macOS: brew install ffmpeg"
+            )
+        if not probe.ok:
+            return "error", (
+                "ffmpeg 无法执行，重装：brew install ffmpeg（macOS）/ apt install ffmpeg（Linux）"
             )
 
         # Check script exists
@@ -32,7 +42,7 @@ class XiaoyuzhouChannel(Channel):
         if not os.path.isfile(script):
             return "off", (
                 "转录脚本未安装。运行：\n"
-                "  agent-reach install --env=auto\n"
+                "  agent-reach install --env=auto --system --channels=xiaoyuzhou\n"
                 "  或手动复制 transcribe.sh 到 ~/.agent-reach/tools/xiaoyuzhou/"
             )
 
@@ -48,7 +58,8 @@ class XiaoyuzhouChannel(Channel):
             return "warn", (
                 "需要配置 Groq API Key（免费）。步骤：\n"
                 "  1. 注册 https://console.groq.com\n"
-                "  2. 运行: agent-reach configure groq-key gsk_xxxxx"
+                "  2. 运行: agent-reach configure groq-key（隐藏输入）"
             )
 
+        self.active_backend = "groq-whisper"
         return "ok", "完整可用（播客下载 + Whisper 转录）"
